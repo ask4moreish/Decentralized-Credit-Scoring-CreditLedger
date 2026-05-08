@@ -1,16 +1,13 @@
-[package]
-name = "credit-ledger-contracts"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "credit_score",
+    "loan_manager",
+    "community_vouch",
+]
+resolver = "2"
 
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
+[workspace.dependencies]
 soroban-sdk = "20.0.0"
-
-[dev-dependencies]
-soroban-sdk = { version = "20.0.0", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"
