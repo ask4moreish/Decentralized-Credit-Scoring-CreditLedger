@@ -18,7 +18,7 @@ pub struct CreditScoreData {
 
 #[contractclient(name = "CreditScoreContractClient")]
 pub trait CreditScoreContract {
-    fn get_credit_score(&self, user: &Address) -> CreditScoreData;
+    fn get_credit_score(env: Env, user: Address) -> CreditScoreData;
 }
 
 #[contracttype]
@@ -377,3 +377,5 @@ impl LoanManagerContract {
         }
     }
 }
+
+mod tests;

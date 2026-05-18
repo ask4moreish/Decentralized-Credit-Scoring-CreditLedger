@@ -265,3 +265,5 @@ impl CreditScoreContract {
             .set(&Symbol::new(&env, "community_vouch_contract"), &community_vouch_contract);
     }
 }
+
+mod tests;

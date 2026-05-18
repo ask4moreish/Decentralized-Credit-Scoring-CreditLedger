@@ -3,9 +3,9 @@ use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address,
 #[contractclient(name = "CreditScoreContractClient")]
 pub trait CreditScoreContract {
     fn add_community_vouch(
-        &self,
-        user: &Address,
-        voucher: &Address,
+        env: Env,
+        user: Address,
+        voucher: Address,
         amount: u128,
         trust_score: u32,
     );
@@ -457,3 +457,5 @@ impl CommunityVouchContract {
         }
     }
 }
+
+mod tests;

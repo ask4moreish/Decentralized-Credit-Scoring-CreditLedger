@@ -86,7 +86,7 @@ router.post('/savings-data', authMiddleware, savingsDataValidation, async (req: 
 
     // Update cache
     const cacheKey = `credit_score:savings:${userPublicKey}`;
-    const existingSavings = await redisCache.get(cacheKey) || [];
+    const existingSavings = (await redisCache.get<any[]>(cacheKey)) || [];
     existingSavings.push(savingsData);
     await redisCache.set(cacheKey, existingSavings, 300);
 
@@ -139,7 +139,7 @@ router.get('/:userPublicKey/payment-history', async (req: Request, res: Response
 
     // Check cache first
     const cacheKey = `credit_score:payment_history:${userPublicKey}`;
-    let paymentHistory = await redisCache.get(cacheKey);
+    let paymentHistory = await redisCache.get<any[]>(cacheKey);
 
     if (!paymentHistory) {
       // For now, return empty array
@@ -175,7 +175,7 @@ router.get('/:userPublicKey/savings-data', async (req: Request, res: Response) =
 
     // Check cache first
     const cacheKey = `credit_score:savings:${userPublicKey}`;
-    let savingsData = await redisCache.get(cacheKey);
+    let savingsData = await redisCache.get<any[]>(cacheKey);
 
     if (!savingsData) {
       // For now, return empty array
@@ -214,8 +214,8 @@ router.get('/:userPublicKey/breakdown', async (req: Request, res: Response) => {
 
     // Get additional data for breakdown
     const [paymentHistory, savingsData] = await Promise.all([
-      redisCache.get(`credit_score:payment_history:${userPublicKey}`) || [],
-      redisCache.get(`credit_score:savings:${userPublicKey}`) || [],
+      redisCache.get<any[]>(`credit_score:payment_history:${userPublicKey}`).then(v => v || []),
+      redisCache.get<any[]>(`credit_score:savings:${userPublicKey}`).then(v => v || []),
     ]);
 
     // Calculate breakdown

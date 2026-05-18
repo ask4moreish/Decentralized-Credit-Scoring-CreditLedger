@@ -79,7 +79,7 @@ router.get('/:loanId', authMiddleware, async (req: Request, res: Response) => {
 
     // Check cache first
     const cacheKey = `loan:${loanId}`;
-    let loan = await redisCache.get(cacheKey);
+    let loan = await redisCache.get<any>(cacheKey);
 
     if (!loan) {
       // Fetch from blockchain
@@ -118,12 +118,12 @@ router.get('/user/:userPublicKey', authMiddleware, async (req: Request, res: Res
 
     // Check cache first
     const cacheKey = `loans:user:${userPublicKey}`;
-    let userLoans = await redisCache.get(cacheKey);
+    let userLoans: any[] = await redisCache.get<any[]>(cacheKey) ?? [];
 
-    if (!userLoans) {
+    if (!userLoans.length) {
       // Fetch from blockchain
       const result = await stellarService.getUserLoans(userPublicKey);
-      userLoans = result.returnValue;
+      userLoans = result.returnValue ?? [];
 
       // Cache for 2 minutes
       await redisCache.set(cacheKey, userLoans, 120);
@@ -206,12 +206,12 @@ router.get('/admin/active', authMiddleware, async (req: Request, res: Response) 
 
     // Check cache first
     const cacheKey = 'loans:active';
-    let activeLoans = await redisCache.get(cacheKey);
+    let activeLoans: any[] = await redisCache.get<any[]>(cacheKey) ?? [];
 
-    if (!activeLoans) {
+    if (!activeLoans.length) {
       // Fetch from blockchain
       const result = await stellarService.getActiveLoans();
-      activeLoans = result.returnValue;
+      activeLoans = result.returnValue ?? [];
 
       // Cache for 1 minute
       await redisCache.set(cacheKey, activeLoans, 60);
