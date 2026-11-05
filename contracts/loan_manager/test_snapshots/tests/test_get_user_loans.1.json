@@ -184,7 +184,7 @@
                         "symbol": "credit_score_used"
                       },
                       "val": {
-                        "u32": 750
+                        "u32": 75
                       }
                     },
                     {
@@ -328,7 +328,7 @@
                         "symbol": "credit_score_used"
                       },
                       "val": {
-                        "u32": 750
+                        "u32": 75
                       }
                     },
                     {

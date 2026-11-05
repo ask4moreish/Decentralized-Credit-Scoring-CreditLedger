@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { stellarService } from '../services/stellarService';
 import { redisCache } from '../config/redis';
+import { dbService } from '../services/dbService';
 import { logger } from '../utils/logger';
 import { authMiddleware } from '../middleware/auth';
 
@@ -19,14 +20,27 @@ router.get('/:publicKey/profile', authMiddleware, async (req: Request, res: Resp
     let profile = await redisCache.get(cacheKey);
 
     if (!profile) {
-      const [creditScoreResult, accountInfo] = await Promise.all([
-        stellarService.getCreditScore(publicKey),
-        stellarService.getAccount(publicKey).catch(() => null),
-      ]);
+      let creditScore: any = null;
+      let accountInfo: any = null;
+
+      try {
+        const creditScoreResult = await stellarService.getCreditScore(publicKey);
+        creditScore = creditScoreResult.returnValue;
+      } catch {
+        creditScore = await dbService.getCachedCreditScore(publicKey);
+      }
+
+      try {
+        accountInfo = await stellarService.getAccount(publicKey);
+      } catch {
+        accountInfo = null;
+      }
+
+      await dbService.upsertUser(publicKey);
 
       profile = {
         publicKey,
-        creditScore: creditScoreResult.returnValue,
+        creditScore: creditScore || { score: 0 },
         accountExists: accountInfo !== null,
       };
 
@@ -49,19 +63,38 @@ router.get('/:publicKey/summary', authMiddleware, async (req: Request, res: Resp
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    const [creditScoreResult, loansResult, vouchesResult] = await Promise.all([
-      stellarService.getCreditScore(publicKey),
-      stellarService.getUserLoans(publicKey),
-      stellarService.getUserVouches(publicKey),
-    ]);
+    let creditScore: any = { score: 0 };
+    let loans: any[] = [];
+    let vouches: any[] = [];
+
+    try {
+      const creditScoreResult = await stellarService.getCreditScore(publicKey);
+      creditScore = creditScoreResult.returnValue || { score: 0 };
+    } catch {
+      creditScore = await dbService.getCachedCreditScore(publicKey) || { score: 0 };
+    }
+
+    try {
+      const loansResult = await stellarService.getUserLoans(publicKey);
+      loans = loansResult.returnValue || [];
+    } catch {
+      loans = await dbService.getUserLoans(publicKey);
+    }
+
+    try {
+      const vouchesResult = await stellarService.getUserVouches(publicKey);
+      vouches = vouchesResult.returnValue || [];
+    } catch {
+      vouches = await dbService.getUserVouches(publicKey);
+    }
 
     res.json({
       success: true,
       data: {
         publicKey,
-        creditScore: creditScoreResult.returnValue,
-        loans: loansResult.returnValue,
-        vouches: vouchesResult.returnValue,
+        creditScore,
+        loans,
+        vouches,
       },
     });
   } catch (error) {

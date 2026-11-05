@@ -1,7 +1,7 @@
 import { createClient, RedisClientType } from 'redis';
 import { logger } from '../utils/logger';
 
-let redisClient: RedisClientType;
+let redisClient: RedisClientType | null = null;
 
 export async function connectRedis(): Promise<RedisClientType> {
   try {
@@ -9,7 +9,6 @@ export async function connectRedis(): Promise<RedisClientType> {
       url: process.env.REDIS_URL || 'redis://localhost:6379',
       socket: {
         connectTimeout: 5000,
-        lazyConnect: true,
       },
     });
 
@@ -49,6 +48,7 @@ export async function disconnectRedis(): Promise<void> {
     if (redisClient) {
       await redisClient.quit();
       logger.info('Redis connection closed');
+      redisClient = null;
     }
   } catch (error) {
     logger.error('Error closing Redis connection:', error);
@@ -58,13 +58,12 @@ export async function disconnectRedis(): Promise<void> {
 
 // Redis utility functions
 export class RedisCache {
-  private client: RedisClientType;
-
-  constructor() {
-    this.client = getRedisClient();
+  private get client(): RedisClientType | null {
+    return redisClient;
   }
 
   async set(key: string, value: any, ttl?: number): Promise<void> {
+    if (!this.client) return;
     const serializedValue = JSON.stringify(value);
     if (ttl) {
       await this.client.setEx(key, ttl, serializedValue);
@@ -74,6 +73,7 @@ export class RedisCache {
   }
 
   async get<T>(key: string): Promise<T | null> {
+    if (!this.client) return null;
     const value = await this.client.get(key);
     if (!value) return null;
     
@@ -86,23 +86,28 @@ export class RedisCache {
   }
 
   async del(key: string): Promise<void> {
+    if (!this.client) return;
     await this.client.del(key);
   }
 
   async exists(key: string): Promise<boolean> {
+    if (!this.client) return false;
     const result = await this.client.exists(key);
     return result === 1;
   }
 
   async increment(key: string, amount: number = 1): Promise<number> {
+    if (!this.client) return 0;
     return await this.client.incrBy(key, amount);
   }
 
   async expire(key: string, ttl: number): Promise<void> {
+    if (!this.client) return;
     await this.client.expire(key, ttl);
   }
 
   async getTTL(key: string): Promise<number> {
+    if (!this.client) return -2;
     return await this.client.ttl(key);
   }
 }

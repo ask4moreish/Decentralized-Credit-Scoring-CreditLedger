@@ -24,9 +24,16 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   }
 
   const token = authHeader.slice(7);
+  const jwtSecret = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'secret');
+
+  if (!jwtSecret) {
+    logger.error('JWT_SECRET is not configured in production');
+    res.status(500).json({ error: 'Authentication configuration error' });
+    return;
+  }
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET || 'secret') as AuthUser;
+    const payload = jwt.verify(token, jwtSecret) as AuthUser;
     req.user = payload;
     next();
   } catch (error) {

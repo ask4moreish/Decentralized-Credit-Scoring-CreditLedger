@@ -271,25 +271,73 @@ jobs:
 
 ## Smart Contract Deployment
 
-### Testnet Deployment
+### Step 1: Compile Release WASM Targets
 ```bash
-# Build contracts
 cd contracts
 cargo build --target wasm32-unknown-unknown --release
+```
 
-# Deploy to testnet
-soroban contract deploy \
+### Step 2: Deploy Contracts to Stellar Testnet
+```bash
+# 1. Deploy CreditScore contract
+CREDIT_SCORE_ID=$(stellar contract deploy \
   --wasm target/wasm32-unknown-unknown/release/credit_score.wasm \
-  --source SA... \
-  --network testnet
+  --source admin_account \
+  --network testnet)
 
-# Initialize contracts
-soroban contract invoke \
-  --id CONTRACT_ID \
-  --source SA... \
+# 2. Deploy CommunityVouch contract
+COMMUNITY_VOUCH_ID=$(stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/community_vouch.wasm \
+  --source admin_account \
+  --network testnet)
+
+# 3. Deploy LoanManager contract
+LOAN_MANAGER_ID=$(stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/loan_manager.wasm \
+  --source admin_account \
+  --network testnet)
+```
+
+### Step 3: Initialize Contracts in Correct Dependency Order
+```bash
+# 1. Initialize CreditScore
+stellar contract invoke \
+  --id $CREDIT_SCORE_ID \
+  --source admin_account \
   --network testnet \
   -- initialize \
-  --admin ADMIN_ADDRESS
+  --admin $(stellar keys address admin_account)
+
+# 2. Initialize CommunityVouch with CreditScore link
+stellar contract invoke \
+  --id $COMMUNITY_VOUCH_ID \
+  --source admin_account \
+  --network testnet \
+  -- initialize \
+  --admin $(stellar keys address admin_account) \
+  --credit_score_contract $CREDIT_SCORE_ID
+
+# 3. Initialize LoanManager with CreditScore link
+stellar contract invoke \
+  --id $LOAN_MANAGER_ID \
+  --source admin_account \
+  --network testnet \
+  -- initialize \
+  --admin $(stellar keys address admin_account) \
+  --credit_score_contract $CREDIT_SCORE_ID
+```
+
+### Step 4: Configure Backend & Run Database Migrations
+Configure contract addresses in `backend/.env`:
+```env
+CREDIT_SCORE_CONTRACT=$CREDIT_SCORE_ID
+LOAN_MANAGER_CONTRACT=$LOAN_MANAGER_ID
+COMMUNITY_VOUCH_CONTRACT=$COMMUNITY_VOUCH_ID
+```
+Run migrations:
+```bash
+cd backend
+npx knex migrate:latest
 ```
 
 ### Mainnet Deployment

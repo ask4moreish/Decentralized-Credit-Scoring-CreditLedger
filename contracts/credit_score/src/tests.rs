@@ -7,7 +7,7 @@ use crate::{CreditScoreContract, CreditScoreContractClient, PaymentRecord, Savin
 fn setup() -> (Env, Address, CreditScoreContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, CreditScoreContract);
+    let contract_id = env.register(CreditScoreContract, ());
     let client = CreditScoreContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     client.initialize(&admin);
@@ -76,12 +76,33 @@ fn test_update_savings_data_increases_score() {
 }
 
 #[test]
+fn test_community_vouch_and_revocation() {
+    let (env, _admin, client) = setup();
+    let user = Address::generate(&env);
+    let voucher = Address::generate(&env);
+    let vouch_contract = Address::generate(&env);
+
+    client.set_community_vouch_contract(&vouch_contract);
+
+    // Add vouch
+    client.add_community_vouch(&user, &voucher, &500_000u128, &80u32);
+    let score_after_vouch = client.get_credit_score(&user);
+    assert!(score_after_vouch.community_score > 0);
+    assert!(score_after_vouch.score > 0);
+
+    // Revoke vouch
+    client.remove_community_vouch(&user, &voucher);
+    let score_after_revoke = client.get_credit_score(&user);
+    assert_eq!(score_after_revoke.community_score, 0);
+}
+
+#[test]
 fn test_is_creditworthy() {
     let (env, _admin, client) = setup();
     let user = Address::generate(&env);
 
-    // No data → score 0 → not creditworthy at 500
-    assert!(!client.is_creditworthy(&user, &500));
+    // No data → score 0 → not creditworthy at 50
+    assert!(!client.is_creditworthy(&user, &50));
 
     // Add enough payment history to push score above 0
     let payments = Vec::from_array(

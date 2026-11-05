@@ -1,5 +1,6 @@
 import {
-  Server,
+  Horizon,
+  rpc,
   Networks,
   TransactionBuilder,
   Operation,
@@ -16,34 +17,55 @@ import { redisCache } from '../config/redis';
 export interface StellarConfig {
   network: Networks;
   horizonUrl: string;
+  rpcUrl: string;
   adminSecret: string;
 }
 
 export class StellarService {
-  private server: Server;
+  private server: Horizon.Server;
+  private rpcServer: rpc.Server;
   private config: StellarConfig;
-  private adminKeypair: Keypair;
+  private adminKeypair: Keypair | null = null;
 
   constructor() {
     this.config = {
       network: process.env.STELLAR_NETWORK === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET,
       horizonUrl: process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org',
+      rpcUrl: process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org',
       adminSecret: process.env.STELLAR_ADMIN_SECRET || '',
     };
 
-    this.server = new Server(this.config.horizonUrl);
-    this.adminKeypair = Keypair.fromSecret(this.config.adminSecret);
+    this.server = new Horizon.Server(this.config.horizonUrl);
+    this.rpcServer = new rpc.Server(this.config.rpcUrl);
+
+    if (this.config.adminSecret) {
+      try {
+        this.adminKeypair = Keypair.fromSecret(this.config.adminSecret);
+      } catch (e) {
+        logger.warn('Invalid STELLAR_ADMIN_SECRET provided; admin signing disabled');
+      }
+    }
+  }
+
+  getAdminPublicKey(): string | null {
+    return this.adminKeypair ? this.adminKeypair.publicKey() : null;
   }
 
   async initialize(): Promise<void> {
     try {
-      const account = await this.server.loadAccount(this.adminKeypair.publicKey());
-      logger.info(`Connected to Stellar network. Admin account: ${account.accountId()}`);
+      if (this.adminKeypair) {
+        try {
+          const account = await this.server.loadAccount(this.adminKeypair.publicKey());
+          logger.info(`Connected to Stellar network. Admin account: ${account.accountId()}`);
+        } catch (err) {
+          logger.warn(`Admin account ${this.adminKeypair.publicKey()} not yet funded on network`);
+        }
+      }
       await this.cacheContractAddresses();
       logger.info('Stellar service initialized successfully');
     } catch (error) {
       logger.error('Failed to initialize Stellar service:', error);
-      throw error;
+      // Non-fatal on startup if offline
     }
   }
 
@@ -62,7 +84,7 @@ export class StellarService {
       await this.cacheContractAddresses();
       contracts = await redisCache.get('stellar:contracts');
     }
-    return contracts!;
+    return contracts || { creditScore: '', loanManager: '', communityVouch: '' };
   }
 
   async getAccount(accountId: string): Promise<Account> {
@@ -74,25 +96,42 @@ export class StellarService {
     }
   }
 
-  async createAccount(newAccountPublicKey: string, startingBalance = '2'): Promise<string> {
+  async buildInvokeContractTransaction(
+    sourcePublicKey: string,
+    contractAddress: string,
+    functionName: string,
+    args: xdr.ScVal[] = []
+  ): Promise<string> {
+    let sourceAccount: Account;
     try {
-      const adminAccount = await this.server.loadAccount(this.adminKeypair.publicKey());
-      const transaction = new TransactionBuilder(adminAccount, {
-        fee: await this.server.fetchBaseFee(),
-        networkPassphrase: this.config.network,
-      })
-        .addOperation(Operation.createAccount({ destination: newAccountPublicKey, startingBalance }))
-        .setTimeout(30)
-        .build();
-
-      transaction.sign(this.adminKeypair);
-      const result = await this.server.submitTransaction(transaction);
-      logger.info(`Account created: ${newAccountPublicKey}, Transaction: ${result.hash}`);
-      return result.hash;
-    } catch (error) {
-      logger.error(`Failed to create account ${newAccountPublicKey}:`, error);
-      throw error;
+      sourceAccount = await this.server.loadAccount(sourcePublicKey);
+    } catch {
+      // Offline fallback sequence for transaction construction
+      sourceAccount = new Account(sourcePublicKey, '0');
     }
+
+    let baseFee = '100';
+    try {
+      baseFee = await this.server.fetchBaseFee().then(f => f.toString()).catch(() => '100');
+    } catch {
+      baseFee = '100';
+    }
+
+    const transaction = new TransactionBuilder(sourceAccount, {
+      fee: baseFee,
+      networkPassphrase: this.config.network,
+    })
+      .addOperation(
+        Operation.invokeContractFunction({
+          contract: contractAddress,
+          function: functionName,
+          args,
+        })
+      )
+      .setTimeout(180)
+      .build();
+
+    return transaction.toXDR();
   }
 
   async invokeContract(
@@ -103,10 +142,15 @@ export class StellarService {
   ): Promise<{ hash: string; returnValue: any }> {
     try {
       const signerKeypair = signer ?? this.adminKeypair;
+      if (!signerKeypair) {
+        throw new Error('No signer available for contract invocation');
+      }
+
       const sourceAccount = await this.server.loadAccount(signerKeypair.publicKey());
+      const baseFee = await this.server.fetchBaseFee().then(f => f.toString()).catch(() => '100');
 
       const transaction = new TransactionBuilder(sourceAccount, {
-        fee: await this.server.fetchBaseFee(),
+        fee: baseFee,
         networkPassphrase: this.config.network,
       })
         .addOperation(
@@ -123,14 +167,14 @@ export class StellarService {
       const result = await this.server.submitTransaction(transaction);
       const returnValue = this.parseContractResult(result);
 
-      return { hash: result.hash, returnValue };
+      return { hash: (result as any).hash, returnValue };
     } catch (error) {
       logger.error(`Failed to invoke contract function ${functionName}:`, error);
       throw error;
     }
   }
 
-  private parseContractResult(result: any): any {
+  parseContractResult(result: any): any {
     try {
       const meta = result.resultMetaXdr
         ? xdr.TransactionMeta.fromXDR(result.resultMetaXdr, 'base64')
@@ -146,12 +190,13 @@ export class StellarService {
     }
   }
 
-  async submitTransaction(transactionXDR: string): Promise<any> {
+  async submitTransaction(transactionXDR: string): Promise<{ hash: string; returnValue: any }> {
     try {
       const transaction = TransactionBuilder.fromXDR(transactionXDR, this.config.network);
-      const result = await this.server.submitTransaction(transaction);
-      logger.info(`Transaction submitted successfully: ${result.hash}`);
-      return result;
+      const result = await this.server.submitTransaction(transaction as any);
+      logger.info(`Transaction submitted successfully: ${(result as any).hash}`);
+      const returnValue = this.parseContractResult(result);
+      return { hash: (result as any).hash, returnValue };
     } catch (error) {
       logger.error('Failed to submit transaction:', error);
       throw error;
@@ -161,7 +206,7 @@ export class StellarService {
   async simulateTransaction(transactionXDR: string): Promise<any> {
     try {
       const transaction = TransactionBuilder.fromXDR(transactionXDR, this.config.network);
-      return await this.server.simulateTransaction(transaction);
+      return await this.rpcServer.simulateTransaction(transaction as any);
     } catch (error) {
       logger.error('Failed to simulate transaction:', error);
       throw error;
@@ -192,22 +237,22 @@ export class StellarService {
     }
   }
 
-  async getContractEvents(contractAddress: string, limit = 10): Promise<any[]> {
-    try {
-      const events = await this.server
-        .events()
-        .forContract(contractAddress)
-        .limit(limit)
-        .order('desc')
-        .call();
-      return events.records;
-    } catch (error) {
-      logger.error(`Failed to get events for contract ${contractAddress}:`, error);
-      throw error;
-    }
-  }
-
   // ── Credit Score ──────────────────────────────────────────────────────────
+
+  async prepareUpdatePaymentHistoryTx(userPublicKey: string, payments: any[]): Promise<string> {
+    const { creditScore } = await this.getContractAddresses();
+    return this.buildInvokeContractTransaction(userPublicKey, creditScore, 'update_payment_history', [
+      new Address(userPublicKey).toScVal(),
+      nativeToScVal(
+        payments.map((p) => ({
+          amount: BigInt(p.amount),
+          timestamp: BigInt(p.timestamp),
+          payment_type: p.paymentType,
+          consistency_score: p.consistencyScore,
+        }))
+      ),
+    ]);
+  }
 
   async updatePaymentHistory(userPublicKey: string, payments: any[]): Promise<any> {
     const { creditScore } = await this.getContractAddresses();
@@ -221,6 +266,19 @@ export class StellarService {
           consistency_score: p.consistencyScore,
         }))
       ),
+    ]);
+  }
+
+  async prepareUpdateSavingsDataTx(userPublicKey: string, savings: any): Promise<string> {
+    const { creditScore } = await this.getContractAddresses();
+    return this.buildInvokeContractTransaction(userPublicKey, creditScore, 'update_savings_data', [
+      new Address(userPublicKey).toScVal(),
+      nativeToScVal({
+        amount: BigInt(savings.amount),
+        timestamp: BigInt(savings.timestamp),
+        duration_months: savings.durationMonths,
+        regularity_score: savings.regularityScore,
+      }),
     ]);
   }
 
@@ -246,12 +304,39 @@ export class StellarService {
 
   // ── Loan Manager ──────────────────────────────────────────────────────────
 
+  async prepareCreateLoanTx(borrowerPublicKey: string, amount: string, durationMonths: number): Promise<string> {
+    const { loanManager } = await this.getContractAddresses();
+    return this.buildInvokeContractTransaction(borrowerPublicKey, loanManager, 'create_loan', [
+      new Address(borrowerPublicKey).toScVal(),
+      nativeToScVal(BigInt(amount), { type: 'i128' }),
+      nativeToScVal(durationMonths, { type: 'u32' }),
+    ]);
+  }
+
   async createLoan(borrowerPublicKey: string, amount: string, durationMonths: number): Promise<any> {
     const { loanManager } = await this.getContractAddresses();
     return this.invokeContract(loanManager, 'create_loan', [
       new Address(borrowerPublicKey).toScVal(),
       nativeToScVal(BigInt(amount), { type: 'i128' }),
       nativeToScVal(durationMonths, { type: 'u32' }),
+    ]);
+  }
+
+  async prepareRepayLoanTx(borrowerPublicKey: string, loanId: number, amount: string): Promise<string> {
+    const { loanManager } = await this.getContractAddresses();
+    return this.buildInvokeContractTransaction(borrowerPublicKey, loanManager, 'repay_loan', [
+      new Address(borrowerPublicKey).toScVal(),
+      nativeToScVal(loanId, { type: 'u64' }),
+      nativeToScVal(BigInt(amount), { type: 'i128' }),
+    ]);
+  }
+
+  async repayLoan(borrowerPublicKey: string, loanId: number, amount: string): Promise<any> {
+    const { loanManager } = await this.getContractAddresses();
+    return this.invokeContract(loanManager, 'repay_loan', [
+      new Address(borrowerPublicKey).toScVal(),
+      nativeToScVal(loanId, { type: 'u64' }),
+      nativeToScVal(BigInt(amount), { type: 'i128' }),
     ]);
   }
 
@@ -269,29 +354,36 @@ export class StellarService {
     ]);
   }
 
-  async repayLoan(borrowerPublicKey: string, loanId: number, amount: string): Promise<any> {
-    const { loanManager } = await this.getContractAddresses();
-    return this.invokeContract(loanManager, 'repay_loan', [
-      new Address(borrowerPublicKey).toScVal(),
-      nativeToScVal(loanId, { type: 'u64' }),
-      nativeToScVal(BigInt(amount), { type: 'i128' }),
-    ]);
-  }
-
   async approveLoan(adminPublicKey: string, loanId: number): Promise<any> {
+    if (!this.adminKeypair) {
+      throw new Error('Admin keypair not configured for loan approval');
+    }
     const { loanManager } = await this.getContractAddresses();
-    return this.invokeContract(loanManager, 'approve_loan', [
-      new Address(adminPublicKey).toScVal(),
-      nativeToScVal(loanId, { type: 'u64' }),
-    ]);
+    return this.invokeContract(
+      loanManager,
+      'approve_loan',
+      [
+        new Address(adminPublicKey).toScVal(),
+        nativeToScVal(loanId, { type: 'u64' }),
+      ],
+      this.adminKeypair
+    );
   }
 
   async markDefault(adminPublicKey: string, loanId: number): Promise<any> {
+    if (!this.adminKeypair) {
+      throw new Error('Admin keypair not configured for default marking');
+    }
     const { loanManager } = await this.getContractAddresses();
-    return this.invokeContract(loanManager, 'mark_default', [
-      new Address(adminPublicKey).toScVal(),
-      nativeToScVal(loanId, { type: 'u64' }),
-    ]);
+    return this.invokeContract(
+      loanManager,
+      'mark_default',
+      [
+        new Address(adminPublicKey).toScVal(),
+        nativeToScVal(loanId, { type: 'u64' }),
+      ],
+      this.adminKeypair
+    );
   }
 
   async getActiveLoans(): Promise<any> {
@@ -315,6 +407,25 @@ export class StellarService {
 
   // ── Community Vouch ───────────────────────────────────────────────────────
 
+  async prepareCreateVouchTx(
+    voucherPublicKey: string,
+    voucheePublicKey: string,
+    amount: string,
+    trustScore: number,
+    reason: string,
+    durationMonths: number
+  ): Promise<string> {
+    const { communityVouch } = await this.getContractAddresses();
+    return this.buildInvokeContractTransaction(voucherPublicKey, communityVouch, 'create_vouch', [
+      new Address(voucherPublicKey).toScVal(),
+      new Address(voucheePublicKey).toScVal(),
+      nativeToScVal(BigInt(amount), { type: 'i128' }),
+      nativeToScVal(trustScore, { type: 'u32' }),
+      nativeToScVal(reason),
+      nativeToScVal(durationMonths, { type: 'u32' }),
+    ]);
+  }
+
   async createVouch(
     voucherPublicKey: string,
     voucheePublicKey: string,
@@ -334,10 +445,11 @@ export class StellarService {
     ]);
   }
 
-  async getUserVouches(userPublicKey: string): Promise<any> {
+  async prepareRevokeVouchTx(voucherPublicKey: string, vouchId: number): Promise<string> {
     const { communityVouch } = await this.getContractAddresses();
-    return this.invokeContract(communityVouch, 'get_user_vouches', [
-      new Address(userPublicKey).toScVal(),
+    return this.buildInvokeContractTransaction(voucherPublicKey, communityVouch, 'revoke_vouch', [
+      new Address(voucherPublicKey).toScVal(),
+      nativeToScVal(vouchId, { type: 'u64' }),
     ]);
   }
 
@@ -346,6 +458,13 @@ export class StellarService {
     return this.invokeContract(communityVouch, 'revoke_vouch', [
       new Address(voucherPublicKey).toScVal(),
       nativeToScVal(vouchId, { type: 'u64' }),
+    ]);
+  }
+
+  async getUserVouches(userPublicKey: string): Promise<any> {
+    const { communityVouch } = await this.getContractAddresses();
+    return this.invokeContract(communityVouch, 'get_user_vouches', [
+      new Address(userPublicKey).toScVal(),
     ]);
   }
 }

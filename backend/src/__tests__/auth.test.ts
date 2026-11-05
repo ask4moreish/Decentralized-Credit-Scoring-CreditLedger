@@ -1,5 +1,6 @@
 import request from 'supertest';
 import express from 'express';
+import { Keypair } from '@stellar/stellar-sdk';
 import { authRoutes } from '../controllers/auth';
 
 const app = express();
@@ -34,14 +35,45 @@ describe('Auth Controller', () => {
     });
 
     it('returns 401 for invalid signature', async () => {
-      // Valid 56-char Stellar public key but with a bad signature
       const res = await request(app).post('/api/auth/login').send({
         publicKey: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN1',
         signature: 'deadbeef',
         challenge: 'testchallenge',
       });
-      // Either 400 (validation) or 401/500 (bad sig) — not 200
       expect(res.status).not.toBe(200);
+    });
+
+    it('authenticates valid signature and prevents challenge replay', async () => {
+      // 1. Generate real Stellar Keypair
+      const keypair = Keypair.random();
+      const publicKey = keypair.publicKey();
+
+      // 2. Request a challenge nonce
+      const challengeRes = await request(app).get('/api/auth/challenge');
+      expect(challengeRes.status).toBe(200);
+      const challenge = challengeRes.body.challenge;
+
+      // 3. Sign the challenge with Ed25519 private key
+      const signature = keypair.sign(Buffer.from(challenge)).toString('hex');
+
+      // 4. Authenticate first time (expect 200 with JWT token)
+      const loginRes = await request(app).post('/api/auth/login').send({
+        publicKey,
+        signature,
+        challenge,
+      });
+      expect(loginRes.status).toBe(200);
+      expect(loginRes.body).toHaveProperty('token');
+      expect(loginRes.body.publicKey).toBe(publicKey);
+
+      // 5. Attempt to REPLAY the exact same challenge and signature (must fail with 401)
+      const replayRes = await request(app).post('/api/auth/login').send({
+        publicKey,
+        signature,
+        challenge,
+      });
+      expect(replayRes.status).toBe(401);
+      expect(replayRes.body.error).toMatch(/Invalid or expired challenge nonce/i);
     });
   });
 });

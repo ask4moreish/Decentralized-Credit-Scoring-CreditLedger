@@ -34,7 +34,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(rateLimiter);
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
@@ -64,12 +64,20 @@ app.use('*', (req, res) => {
 async function startServer() {
   try {
     // Connect to database
-    await connectDatabase();
-    logger.info('Database connected successfully');
+    try {
+      await connectDatabase();
+      logger.info('Database connected successfully');
+    } catch (err) {
+      logger.warn('Database initial connection failed, proceeding with fallback modes');
+    }
 
     // Connect to Redis
-    await connectRedis();
-    logger.info('Redis connected successfully');
+    try {
+      await connectRedis();
+      logger.info('Redis connected successfully');
+    } catch (err) {
+      logger.warn('Redis initial connection failed, proceeding with in-memory caching');
+    }
 
     // Initialize Stellar service
     await stellarService.initialize();
@@ -103,15 +111,8 @@ process.on('SIGINT', async () => {
   });
 });
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', error);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
 
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
-});
-
-startServer();
+export { app, server };

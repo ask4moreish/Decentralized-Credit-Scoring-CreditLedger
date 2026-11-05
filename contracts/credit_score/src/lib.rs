@@ -1,3 +1,4 @@
+#![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec, String, Symbol};
 
 #[contracttype]
@@ -118,6 +119,34 @@ impl CreditScoreContract {
 
         env.storage().persistent().set(&DataKey::CommunityVouches(user.clone()), &vouches);
         Self::recalculate_credit_score(&env, &user);
+    }
+
+    /// Called exclusively by the CommunityVouch contract when a vouch is revoked or expired.
+    pub fn remove_community_vouch(
+        env: Env,
+        user: Address,
+        voucher: Address,
+    ) {
+        let community_vouch_contract: Address = env
+            .storage().instance()
+            .get(&Symbol::new(&env, "community_vouch_contract"))
+            .expect("community_vouch_contract not set");
+        community_vouch_contract.require_auth();
+
+        let vouches_opt: Option<Vec<VouchSummary>> = env
+            .storage().persistent()
+            .get(&DataKey::CommunityVouches(user.clone()));
+
+        if let Some(vouches) = vouches_opt {
+            let mut updated_vouches: Vec<VouchSummary> = Vec::new(&env);
+            for v in vouches.iter() {
+                if v.voucher != voucher {
+                    updated_vouches.push_back(v);
+                }
+            }
+            env.storage().persistent().set(&DataKey::CommunityVouches(user.clone()), &updated_vouches);
+            Self::recalculate_credit_score(&env, &user);
+        }
     }
 
     fn recalculate_credit_score(env: &Env, user: &Address) {

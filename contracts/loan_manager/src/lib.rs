@@ -1,10 +1,8 @@
+#![no_std]
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, Address, Env, Vec, Symbol,
 };
 
-// Import CreditScoreData from the credit_score crate.
-// In a workspace build the type is shared; here we redeclare the minimal shape
-// needed so this crate compiles independently.
 #[contracttype]
 #[derive(Clone)]
 pub struct CreditScoreData {
@@ -75,6 +73,13 @@ impl LoanManagerContract {
     pub fn create_loan(env: Env, borrower: Address, amount: u128, duration_months: u32) -> u64 {
         borrower.require_auth();
 
+        if amount == 0 {
+            panic!("Loan amount must be positive");
+        }
+        if duration_months == 0 || duration_months > 60 {
+            panic!("Invalid duration");
+        }
+
         let credit_score_contract: Address = env
             .storage()
             .instance()
@@ -92,7 +97,6 @@ impl LoanManagerContract {
         }
 
         // Increment counter first; the new loan's id equals the incremented value.
-        // (Counter starts at 0, so first loan id = 1.)
         let loan_id: u64 = env
             .storage()
             .instance()
@@ -136,8 +140,6 @@ impl LoanManagerContract {
     }
 
     pub fn approve_loan(env: Env, admin: Address, loan_id: u64) {
-        // Authenticate the passed-in admin address directly instead of
-        // re-fetching from storage and ignoring the parameter.
         admin.require_auth();
 
         let stored_admin: Address = env
@@ -164,7 +166,6 @@ impl LoanManagerContract {
             .persistent()
             .set(&LoanDataKey::Loan(loan_id), &loan);
 
-        // Only add to active list once approved, not when pending.
         let mut active_loans: Vec<u64> = env
             .storage()
             .persistent()
@@ -178,6 +179,10 @@ impl LoanManagerContract {
 
     pub fn repay_loan(env: Env, borrower: Address, loan_id: u64, amount: u128) {
         borrower.require_auth();
+
+        if amount == 0 {
+            panic!("Repayment amount must be positive");
+        }
 
         let mut loan: Loan = env
             .storage()
@@ -255,7 +260,8 @@ impl LoanManagerContract {
             CreditScoreContractClient::new(&env, &credit_score_contract)
                 .get_credit_score(&user);
 
-        if credit_score_data.score < 500 {
+        // Consistent 0-100 scale: minimum score to borrow is 50
+        if credit_score_data.score < 50 {
             return false;
         }
 
@@ -286,14 +292,12 @@ impl LoanManagerContract {
             return false;
         }
 
-        // Cap is a fixed multiple of the *credit score*, not of the requested amount.
-        // Using requested-amount as the multiplier base made the cap grow with the
-        // request, which meant any amount was always within its own cap.
+        // Tiers aligned to 0-100 scale
         let max_debt: u128 = match credit_score_data.score {
-            800..=1000 => 10_000_000,
-            700..=799 => 7_000_000,
-            600..=699 => 5_000_000,
-            500..=599 => 3_000_000,
+            80..=100 => 10_000_000,
+            70..=79 => 7_000_000,
+            60..=69 => 5_000_000,
+            50..=59 => 3_000_000,
             _ => 0,
         };
 
@@ -322,8 +326,6 @@ impl LoanManagerContract {
     }
 
     pub fn get_loan_statistics(env: Env) -> (u64, u64) {
-        // Returns (total_loans_ever, currently_active_loans).
-        // Previously returned Map<String, u64> which required the unused Map import.
         let total: u64 = env
             .storage()
             .instance()
@@ -342,18 +344,19 @@ impl LoanManagerContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    // Consistent 0-100 scale
     fn calculate_interest_rate(credit_score: u32) -> u32 {
         match credit_score {
-            800..=1000 => 5,
-            700..=799 => 8,
-            600..=699 => 12,
-            500..=599 => 18,
+            80..=100 => 5,
+            70..=79 => 8,
+            60..=69 => 12,
+            50..=59 => 18,
             _ => 25,
         }
     }
 
     fn is_collateral_required(credit_score: u32) -> bool {
-        credit_score < 600
+        credit_score < 60
     }
 
     fn calculate_total_due(loan: &Loan) -> u128 {

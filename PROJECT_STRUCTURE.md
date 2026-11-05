@@ -1,144 +1,131 @@
-# CreditLedger - Decentralized Credit Scoring System
+# CreditLedger — Project Architecture & Codebase Structure
 
-## Project Overview
-CreditLedger is a Web3 application that builds on-chain credit scores from alternative data sources, enabling access to DeFi loans without traditional banking history.
+## Overview
+CreditLedger is a decentralized alternative credit scoring and lending protocol built natively for the Stellar network using Soroban smart contracts, a Node.js/Express backend with PostgreSQL and Redis, and a React 18 frontend with Freighter wallet integration.
 
-## Core Features
-- **Alternative Data Integration**: Mobile payments, savings behavior, community vouching
-- **On-Chain Credit Scoring**: Transparent and immutable credit history
-- **DeFi Loan Access**: Collateral-free loans based on credit scores
-- **Community Vouching**: Social proof and trust networks
-- **Stellar Blockchain**: Fast, low-cost transactions
+---
 
-## Architecture Breakdown
+## Actual Codebase Structure
 
-### 1. Smart Contracts (Stellar)
 ```
-contracts/
-├── CreditScore.sol              # Main credit scoring contract
-├── DataOracle.sol               # External data integration
-├── LoanManager.sol              # Loan management logic
-├── CommunityVouch.sol           # Community vouching system
-├── Token.sol                    # Utility token for platform
-└── utils/
-    ├── Libraries.sol            # Reusable libraries
-    └── Interfaces.sol            # Contract interfaces
+Decentralized-Credit-Scoring-CreditLedger/
+├── contracts/                                # Stellar Soroban Smart Contracts (Rust)
+│   ├── Cargo.toml                            # Workspace configuration
+│   ├── Cargo.lock                            # Pinned dependencies (ed25519-dalek 2.2.0)
+│   ├── credit_score/                         # CreditScore Contract crate
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                        # Deterministic 0-100 scoring algorithm (#![no_std])
+│   │       └── test.rs                       # Unit and integration test suite
+│   ├── loan_manager/                         # LoanManager Contract crate
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                        # Origination, 0-100 tier thresholds, overpayment checks
+│   │       └── test.rs                       # Test suite with configurable mock credit scoring
+│   ├── community_vouch/                      # CommunityVouch Contract crate
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                        # Social trust network & revocation propagation
+│   │       └── test.rs                       # Revocation and expiration test suite
+│   └── target/wasm32-unknown-unknown/release/ # Compiled release WASM binaries
+│       ├── credit_score.wasm
+│       ├── loan_manager.wasm
+│       └── community_vouch.wasm
+│
+├── backend/                                  # Backend API & Database Service (TypeScript)
+│   ├── package.json                          # Dependencies (@stellar/stellar-sdk 13.x, knex, redis)
+│   ├── tsconfig.json                         # TypeScript build configuration
+│   ├── knexfile.ts                           # Knex PostgreSQL connection settings
+│   ├── Dockerfile                            # Multi-stage production container build
+│   ├── healthcheck.js                        # Healthcheck monitor for Docker
+│   ├── database/
+│   │   └── init.sql                          # Initial PostgreSQL schema definition
+│   ├── migrations/                           # Knex database migrations
+│   │   └── 20261104000000_create_credit_ledger_tables.ts
+│   └── src/
+│       ├── index.ts                          # Express server entrypoint & graceful shutdown
+│       ├── config/
+│       │   ├── database.ts                   # Knex PostgreSQL client
+│       │   └── redis.ts                      # Redis client with in-memory fallback
+│       ├── services/
+│       │   ├── dbService.ts                  # Persistent PostgreSQL database operations
+│       │   └── stellarService.ts             # Horizon / Soroban RPC & non-custodial tx preparation
+│       ├── controllers/
+│       │   ├── auth.ts                       # Cryptographic challenge nonce & JWT sessions
+│       │   ├── creditScore.ts                # 0-100 score caching, trends, and non-custodial prep
+│       │   ├── loan.ts                       # Loan application, repayment, and admin endpoints
+│       │   ├── vouch.ts                      # Vouch creation, revocation, and queries
+│       │   └── user.ts                       # User profile and financial summary
+│       ├── middleware/
+│       │   ├── auth.ts                       # JWT verification and resource authorization
+│       │   ├── errorHandler.ts               # Global error handler
+│       │   └── rateLimiter.ts                # Request rate limiting
+│       ├── utils/
+│       │   └── logger.ts                     # Winston structured logging
+│       └── __tests__/                        # Backend Jest test suites
+│           ├── auth.test.ts
+│           ├── creditScore.test.ts
+│           ├── loan.test.ts
+│           ├── middleware.test.ts
+│           └── nonCustodial.test.ts          # Non-custodial transaction prep & submission tests
+│
+├── frontend/                                 # Frontend Web Application (React 18 + Vite)
+│   ├── package.json                          # Dependencies (@stellar/freighter-api, zustand)
+│   ├── tsconfig.json                         # TypeScript configuration with Vitest types
+│   ├── vite.config.ts                        # Vite configuration & proxy
+│   ├── Dockerfile                            # Production Nginx multi-stage container
+│   ├── nginx.conf                            # Nginx reverse proxy and caching configuration
+│   └── src/
+│       ├── main.tsx                          # React DOM entrypoint
+│       ├── App.tsx                           # App shell and routing
+│       ├── config/
+│       │   └── stellar.ts                    # Network settings & passphrases
+│       ├── store/
+│       │   └── walletStore.ts                # Freighter wallet connection & JWT exchange
+│       ├── components/
+│       │   ├── Layout.tsx                    # Navigation & responsive layout wrapper
+│       │   ├── LoadingSpinner.tsx            # Loading indicator component
+│       │   ├── Button.tsx                    # Polymorphic UI Button component
+│       │   └── Card.tsx                      # Reusable UI Card container
+│       ├── pages/
+│       │   ├── HomePage.tsx                  # Protocol landing page & feature overview
+│       │   ├── DashboardPage.tsx             # User navigation overview
+│       │   ├── CreditScorePage.tsx           # Authoritative 0-100 score display & breakdown
+│       │   ├── LoansPage.tsx                 # Non-custodial loan application & repayment
+│       │   ├── VouchPage.tsx                 # Community vouch creation & revocation
+│       │   ├── ProfilePage.tsx               # Stellar account details & session controls
+│       │   └── LoginPage.tsx                 # Freighter wallet authentication
+│       └── __tests__/                        # Frontend Vitest test suites
+│           ├── setup.ts
+│           ├── LoadingSpinner.test.tsx
+│           ├── stellar.test.ts
+│           └── walletStore.test.ts
+│
+├── .github/
+│   └── workflows/
+│       └── ci.yml                            # GitHub Actions CI matrix (Contracts, Backend, Frontend)
+├── docker-compose.yml                        # Docker Compose multi-service orchestrator
+├── .env.example                              # Root environment variables template
+├── LICENSE                                   # MIT License
+├── SECURITY.md                               # Security policy and disclosure instructions
+├── CONTRIBUTING.md                           # Contributor guidelines and workflow
+├── DEPLOYMENT.md                             # Testnet & production deployment instructions
+└── README.md                                 # Primary project documentation
 ```
 
-### 2. Backend Services
-```
-backend/
-├── src/
-│   ├── controllers/            # API endpoints
-│   ├── services/               # Business logic
-│   ├── models/                 # Data models
-│   ├── middleware/             # Authentication & validation
-│   ├── utils/                  # Helper functions
-│   └── config/                 # Configuration files
-├── tests/                      # Unit and integration tests
-└── scripts/                    # Deployment and utility scripts
-```
+---
 
-### 3. Frontend Application
-```
-frontend/
-├── src/
-│   ├── components/             # Reusable UI components
-│   ├── pages/                  # Application pages
-│   ├── hooks/                  # Custom React hooks
-│   ├── services/               # API and blockchain services
-│   ├── utils/                  # Helper functions
-│   ├── store/                  # State management
-│   └── styles/                 # Styling and themes
-└── public/                     # Static assets
-```
+## Component Status Matrix
 
-### 4. Infrastructure & DevOps
-```
-infrastructure/
-├── docker/                     # Docker configurations
-├── kubernetes/                 # K8s deployment files
-├── scripts/                    # Deployment scripts
-└── monitoring/                 # Logging and monitoring
-```
-
-## Technology Stack
-
-### Smart Contracts
-- **Stellar Soroban**: Smart contract platform
-- **Rust**: Contract development language
-- **Stellar CLI**: Deployment and testing
-
-### Backend
-- **Node.js**: Runtime environment
-- **Express.js**: Web framework
-- **PostgreSQL**: Primary database
-- **Redis**: Caching layer
-- **Stellar SDK**: Blockchain integration
-
-### Frontend
-- **React 18**: UI framework
-- **TypeScript**: Type safety
-- **Tailwind CSS**: Styling
-- **Vite**: Build tool
-- **Wagmi**: Web3 wallet connection
-- **Stellar Wallet SDK**: Stellar integration
-
-### DevOps & Infrastructure
-- **Docker**: Containerization
-- **GitHub Actions**: CI/CD
-- **AWS**: Cloud infrastructure
-- **Vercel**: Frontend hosting
-
-## Key Components
-
-### Credit Scoring Algorithm
-1. **Payment History (40%)**: Mobile payment consistency
-2. **Savings Behavior (30%)**: Regular savings patterns
-3. **Community Trust (20%)**: Vouching from trusted members
-4. **Platform Activity (10%)**: Usage and engagement
-
-### Data Sources
-- **Mobile Payment APIs**: Integration with payment providers
-- **Bank APIs**: Traditional banking data (with consent)
-- **Social Graph**: Community relationships and trust
-- **On-Chain History**: DeFi and blockchain activity
-
-### Security Features
-- **Zero-Knowledge Proofs**: Privacy-preserving verification
-- **Multi-Signature Wallets**: Enhanced security
-- **Audit Trail**: Complete transaction history
-- **Rate Limiting**: Anti-manipulation measures
-
-## Development Phases
-
-### Phase 1: Core Infrastructure
-- Project setup and basic structure
-- Stellar smart contract development
-- Basic backend API
-- Simple frontend interface
-
-### Phase 2: Data Integration
-- External API integrations
-- Credit scoring algorithm implementation
-- User authentication and profiles
-- Basic dashboard
-
-### Phase 3: DeFi Integration
-- Loan management system
-- Collateral-free lending
-- Risk assessment models
-- Advanced analytics
-
-### Phase 4: Scaling & Optimization
-- Performance optimization
-- Security audits
-- Community features
-- Mobile application
-
-## Success Metrics
-- **User Adoption**: Number of active users
-- **Credit Scores Distributed**: Total credit scores issued
-- **Loans Facilitated**: Volume of loans processed
-- **Community Growth**: Active vouching participants
-- **Technical Performance**: Transaction speed and costs
+| Component | Technology | Primary File(s) | Status | Test Coverage |
+| :--- | :--- | :--- | :---: | :---: |
+| **CreditScore Contract** | Rust (Soroban) | `contracts/credit_score/src/lib.rs` | **Verified** | 8 tests passing |
+| **LoanManager Contract** | Rust (Soroban) | `contracts/loan_manager/src/lib.rs` | **Verified** | 16 tests passing |
+| **CommunityVouch Contract**| Rust (Soroban) | `contracts/community_vouch/src/lib.rs` | **Verified** | 10 tests passing |
+| **Backend REST API** | Express / TS | `backend/src/index.ts` | **Verified** | 32 tests passing |
+| **Database Persistence** | PostgreSQL / Knex| `backend/src/services/dbService.ts` | **Verified** | Integrated |
+| **Cache & Sessions** | Redis | `backend/src/config/redis.ts` | **Verified** | Integrated |
+| **Frontend UI** | React 18 / Vite | `frontend/src/App.tsx` | **Verified** | 14 tests passing |
+| **Wallet Signing** | Freighter API | `frontend/src/store/walletStore.ts` | **Verified** | Integrated |
+| **Containerization** | Docker / Compose | `docker-compose.yml` | **Verified** | Multi-stage |
+| **CI / CD Pipeline** | GitHub Actions | `.github/workflows/ci.yml` | **Verified** | Full CI Matrix |

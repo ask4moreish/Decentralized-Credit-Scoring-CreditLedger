@@ -1,3 +1,4 @@
+#![no_std]
 use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env, Vec, String, Symbol};
 
 #[contractclient(name = "CreditScoreContractClient")]
@@ -8,6 +9,11 @@ pub trait CreditScoreContract {
         voucher: Address,
         amount: u128,
         trust_score: u32,
+    );
+    fn remove_community_vouch(
+        env: Env,
+        user: Address,
+        voucher: Address,
     );
 }
 
@@ -212,6 +218,15 @@ impl CommunityVouchContract {
         let vouchee_addr = vouch.vouchee.clone();
         Self::update_trust_network(&env, &voucher_addr);
         Self::update_trust_network(&env, &vouchee_addr);
+
+        // Notify CreditScore contract to remove community vouch
+        if let Some(credit_score_contract) = env
+            .storage().instance()
+            .get::<_, Address>(&Symbol::new(&env, "credit_score_contract"))
+        {
+            CreditScoreContractClient::new(&env, &credit_score_contract)
+                .remove_community_vouch(&vouchee_addr, &voucher_addr);
+        }
     }
 
     /// Expire a single vouch by id. Must be called by the voucher or vouchee.
@@ -244,6 +259,15 @@ impl CommunityVouchContract {
         let vouchee_addr = vouch.vouchee.clone();
         Self::update_trust_network(&env, &voucher_addr);
         Self::update_trust_network(&env, &vouchee_addr);
+
+        // Notify CreditScore contract to remove community vouch
+        if let Some(credit_score_contract) = env
+            .storage().instance()
+            .get::<_, Address>(&Symbol::new(&env, "credit_score_contract"))
+        {
+            CreditScoreContractClient::new(&env, &credit_score_contract)
+                .remove_community_vouch(&vouchee_addr, &voucher_addr);
+        }
     }
 
     fn update_trust_network(env: &Env, user: &Address) {

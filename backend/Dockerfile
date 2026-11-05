@@ -1,26 +1,31 @@
-FROM node:18-alpine
+# Stage 1: Build
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies
+COPY package*.json tsconfig.json ./
+RUN npm ci
+
+COPY src/ ./src/
+RUN npm run build
+
+# Stage 2: Production runtime
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
 COPY package*.json ./
 RUN npm ci --only=production
 
-# Copy source code
-COPY . .
-
-# Build the application
-RUN npm run build
-
-# Create logs directory
+COPY --from=builder /app/dist ./dist
+COPY healthcheck.js ./
 RUN mkdir -p logs
 
-# Expose port
 EXPOSE 3001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node healthcheck.js
 
-# Start the application
-CMD ["npm", "start"]
+CMD ["node", "dist/index.js"]

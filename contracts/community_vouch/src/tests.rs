@@ -2,9 +2,9 @@
 
 use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env, String};
 
-use crate::{CommunityVouchContract, CommunityVouchContractClient, CreditScoreContract};
+use crate::{CommunityVouchContract, CommunityVouchContractClient};
 
-// ── Mock CreditScore that accepts add_community_vouch calls ──────────────────
+// ── Mock CreditScore that accepts add_community_vouch and remove_community_vouch ──
 
 #[contract]
 pub struct MockCreditScore;
@@ -20,6 +20,14 @@ impl MockCreditScore {
     ) {
         // no-op
     }
+
+    pub fn remove_community_vouch(
+        _env: Env,
+        _user: Address,
+        _voucher: Address,
+    ) {
+        // no-op
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -28,8 +36,8 @@ fn setup() -> (Env, Address, CommunityVouchContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
 
-    let mock_cs_id = env.register_contract(None, MockCreditScore);
-    let contract_id = env.register_contract(None, CommunityVouchContract);
+    let mock_cs_id = env.register(MockCreditScore, ());
+    let contract_id = env.register(CommunityVouchContract, ());
     let client = CommunityVouchContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
 
