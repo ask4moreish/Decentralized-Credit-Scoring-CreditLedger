@@ -128,6 +128,11 @@ jobs:
       - name: Run Jest unit & security test suites
         run: npm test -- --ci --forceExit
 
+      - name: Run live PostgreSQL & Redis integration suite
+        env:
+          TEST_REQUIRE_DB: '1'
+        run: npx jest src/__tests__/postgresRedis.integration.test.ts --ci --forceExit
+
       - name: Audit backend production dependencies (fail on critical, log full report)
         run: |
           npm audit --omit=dev --audit-level=critical
