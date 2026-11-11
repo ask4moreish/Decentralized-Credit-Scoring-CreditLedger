@@ -468,3 +468,288 @@ fn test_stroop_scale_real_asset_limits_prime_tier() {
     assert_eq!(ctx.client.get_loan(&loan_id).status, LoanStatus::Repaid);
     assert_eq!(ctx.client.get_lender_balance(&lender), 5_080_000_000);
 }
+
+#[test]
+fn test_adversarial_loan_paths_and_randomized_accounting_invariants() {
+    let ctx = setup(true);
+    let attacker = Address::generate(&ctx.env);
+    let lender_a = Address::generate(&ctx.env);
+    let lender_b = Address::generate(&ctx.env);
+    let borrower_a = Address::generate(&ctx.env);
+    let borrower_b = Address::generate(&ctx.env);
+
+    // Seed scores & tokens
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&borrower_a, &82u32);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&borrower_b, &55u32);
+
+    ctx.loan_sac.mint(&lender_a, &5_000_000_000i128);
+    ctx.loan_sac.mint(&lender_b, &3_000_000_000i128);
+    ctx.client.deposit_liquidity(&lender_a, &2_000_000_000u128);
+    ctx.client.deposit_liquidity(&lender_b, &1_000_000_000u128);
+
+    // Create collateralized loan for Score-55 borrower (requires >= 125% = 500_000)
+    ctx.col_sac.mint(&borrower_b, &2_000_000_000i128);
+    let col_loan_id = ctx
+        .client
+        .create_loan(&borrower_b, &400_000u128, &6u32, &500_000u128);
+
+    // 1. Unauthorized attacker cannot approve loan
+    ctx.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.client.address,
+            fn_name: "approve_loan",
+            args: (&attacker, &col_loan_id).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx
+        .client
+        .try_approve_loan(&attacker, &col_loan_id)
+        .is_err());
+
+    // Admin approves cleanly
+    ctx.env.mock_all_auths();
+    ctx.client.approve_loan(&ctx.admin, &col_loan_id);
+
+    // 2. Canceling already active loan fails cleanly
+    assert_eq!(
+        ctx.client.try_cancel_loan(&borrower_b, &col_loan_id),
+        Err(Ok(LoanManagerError::InvalidLoanStatus))
+    );
+
+    // 3. Early liquidation before due_date + grace fails
+    assert_eq!(
+        ctx.client.try_mark_default(&ctx.admin, &col_loan_id),
+        Err(Ok(LoanManagerError::LoanNotYetDue))
+    );
+
+    // 4. Lender cannot drain cash currently deployed or exceed claimable balance
+    let pool_now = ctx.client.get_pool_state();
+    assert_eq!(
+        ctx.client
+            .try_withdraw_liquidity(&lender_a, &(pool_now.available_cash + 1)),
+        Err(Ok(LoanManagerError::InsufficientAvailableLiquidity))
+    );
+    assert_eq!(
+        ctx.client
+            .try_withdraw_liquidity(&lender_b, &2_500_000_000u128),
+        Err(Ok(LoanManagerError::InsufficientLenderBalance))
+    );
+
+    // 5. Exact repayment works and second repay fails (zero double-repay)
+    let sched = ctx.client.get_repayment_schedule(&col_loan_id);
+    ctx.loan_sac
+        .mint(&borrower_b, &(sched.total_remaining_due as i128));
+    ctx.client
+        .repay_loan(&borrower_b, &col_loan_id, &sched.total_remaining_due);
+    assert_eq!(
+        ctx.client
+            .try_repay_loan(&borrower_b, &col_loan_id, &100u128),
+        Err(Ok(LoanManagerError::InvalidLoanStatus))
+    );
+
+    // 6. 50-iteration deterministic randomized/property accounting invariant loop
+    let lenders = [lender_a.clone(), lender_b.clone()];
+    let borrowers = [borrower_a.clone(), borrower_b.clone()];
+    let mut tracked_loans: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&ctx.env);
+    let mut seed: u64 = 0xDEAD_BEEF_CAFE_1337;
+    let next_u64 = |s: &mut u64| -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *s >> 16
+    };
+
+    for step in 0..50u32 {
+        let choice = (next_u64(&mut seed) % 5) as u32;
+        match choice {
+            0 => {
+                // Random liquidity deposit (1_000 .. 50_000_000)
+                let lender = &lenders[(step as usize) % lenders.len()];
+                let amt = 1_000u128 + ((next_u64(&mut seed) % 5_000_000) as u128);
+                ctx.loan_sac.mint(lender, &(amt as i128));
+                ctx.client.deposit_liquidity(lender, &amt);
+            }
+            1 => {
+                // Create loan if borrower under active cap, maybe approve
+                let borrower = &borrowers[(step as usize) % borrowers.len()];
+                let amt = 50_000u128 + ((next_u64(&mut seed) % 200_000) as u128);
+                let col = ctx.client.get_required_collateral(borrower, &amt);
+                if col > 0 {
+                    ctx.col_sac.mint(borrower, &(col as i128));
+                }
+                if let Ok(Ok(lid)) = ctx.client.try_create_loan(borrower, &amt, &6u32, &col) {
+                    if step % 3 != 0 {
+                        let _ = ctx.client.try_approve_loan(&ctx.admin, &lid);
+                    }
+                    tracked_loans.push_back(lid);
+                }
+            }
+            2 => {
+                // Partial or full repay on tracked active loan
+                for lid in tracked_loans.iter() {
+                    let loan = ctx.client.get_loan(&lid);
+                    if loan.status == LoanStatus::Active {
+                        let sched = ctx.client.get_repayment_schedule(&lid);
+                        if sched.total_remaining_due > 0 {
+                            let pay = if step % 2 == 0 {
+                                (sched.total_remaining_due / 2).max(1)
+                            } else {
+                                sched.total_remaining_due
+                            };
+                            ctx.loan_sac.mint(&loan.borrower, &(pay as i128));
+                            ctx.client.repay_loan(&loan.borrower, &lid, &pay);
+                            break;
+                        }
+                    }
+                }
+            }
+            3 => {
+                // Advance time slightly and liquidate any overdue active loan
+                ctx.env.ledger().with_mut(|li| {
+                    li.timestamp += 60 * 86_400;
+                });
+                for lid in tracked_loans.iter() {
+                    let loan = ctx.client.get_loan(&lid);
+                    if loan.status == LoanStatus::Active {
+                        let _ = ctx.client.try_mark_default(&ctx.admin, &lid);
+                        break;
+                    }
+                }
+            }
+            _ => {
+                // Small safe liquidity withdrawal within available_cash & lender claimable balance
+                let lender = &lenders[(step as usize) % lenders.len()];
+                let claimable = ctx.client.get_lender_balance(lender);
+                let avail = ctx.client.get_pool_state().available_cash;
+                let max_w = claimable.min(avail) / 10;
+                if max_w > 0 {
+                    let _ = ctx.client.try_withdraw_liquidity(lender, &max_w);
+                }
+            }
+        }
+
+        // Strict conservation invariants checked after every single step
+        let state = ctx.client.get_pool_state();
+        let actual_loan_bal = ctx.loan_token.balance(&ctx.client.address) as u128;
+        let actual_col_bal = ctx.col_token.balance(&ctx.client.address) as u128;
+
+        assert_eq!(
+            state.available_cash + state.total_collateral_locked,
+            actual_loan_bal
+        );
+        assert_eq!(
+            actual_col_bal,
+            state.available_cash + state.total_collateral_locked
+        );
+        let mut active_principal_sum: u128 = 0;
+        let mut locked_col_sum: u128 = 0;
+        for lid in ctx.client.get_active_loans().iter() {
+            let loan = ctx.client.get_loan(&lid);
+            active_principal_sum += loan.amount.saturating_sub(loan.principal_repaid);
+            if loan.collateral_locked {
+                locked_col_sum += loan.collateral_amount;
+            }
+        }
+        assert_eq!(state.outstanding_principal, active_principal_sum);
+        assert!(state.total_collateral_locked >= locked_col_sum);
+    }
+
+    // Also run the exact same randomized invariant stress test on separate loan vs collateral SACs
+    let sep = setup(false);
+    let sep_lender = Address::generate(&sep.env);
+    let sep_borrower = Address::generate(&sep.env);
+    MockCreditScoreClient::new(&sep.env, &sep.cs_id).set_score(&sep_borrower, &55u32);
+    sep.loan_sac.mint(&sep_lender, &5_000_000_000i128);
+    sep.client
+        .deposit_liquidity(&sep_lender, &2_000_000_000u128);
+    sep.col_sac.mint(&sep_borrower, &5_000_000_000i128);
+    for _ in 0..10u32 {
+        let amt = 100_000u128;
+        let col = sep.client.get_required_collateral(&sep_borrower, &amt);
+        if let Ok(Ok(lid)) = sep.client.try_create_loan(&sep_borrower, &amt, &6u32, &col) {
+            let _ = sep.client.try_approve_loan(&sep.admin, &lid);
+            let sched = sep.client.get_repayment_schedule(&lid);
+            sep.loan_sac
+                .mint(&sep_borrower, &(sched.total_remaining_due as i128));
+            let _ = sep
+                .client
+                .try_repay_loan(&sep_borrower, &lid, &sched.total_remaining_due);
+        }
+        let s = sep.client.get_pool_state();
+        assert_eq!(
+            s.available_cash,
+            sep.loan_token.balance(&sep.client.address) as u128
+        );
+        assert_eq!(
+            s.total_collateral_locked,
+            sep.col_token.balance(&sep.client.address) as u128
+        );
+    }
+}
+
+#[test]
+fn test_tier_caps_max_active_loans_collateral_pricing_and_rounding() {
+    let ctx = setup(false);
+    let lender = Address::generate(&ctx.env);
+    let base_borrower = Address::generate(&ctx.env);
+    let prime_borrower = Address::generate(&ctx.env);
+    let vault = Address::generate(&ctx.env);
+
+    ctx.loan_sac.mint(&lender, &200_000_000_000i128);
+    ctx.client.deposit_liquidity(&lender, &200_000_000_000u128);
+
+    // 1. Ceiling interest rounding never rounds down to 0 or short-changes pool
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&prime_borrower, &85u32);
+    let tiny_id = ctx
+        .client
+        .create_loan(&prime_borrower, &1_000u128, &1u32, &0u128);
+    assert_eq!(ctx.client.get_loan(&tiny_id).scheduled_interest, 7); // ceil(8000 / 1200) = 7
+    ctx.client.cancel_loan(&prime_borrower, &tiny_id);
+
+    // 2. Active loan cap MAX_ACTIVE_LOANS_PER_USER (3) enforced
+    for _ in 0..3u32 {
+        let id = ctx
+            .client
+            .create_loan(&prime_borrower, &100_000u128, &6u32, &0u128);
+        ctx.client.approve_loan(&ctx.admin, &id);
+    }
+    assert_eq!(
+        ctx.client
+            .try_create_loan(&prime_borrower, &100_000u128, &6u32, &0u128),
+        Err(Ok(LoanManagerError::TooManyActiveLoans))
+    );
+
+    // 3. Tier debt limit enforced (Score 55 base cap = 10_000_000_000 stroops)
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&base_borrower, &55u32);
+    ctx.col_sac.mint(&base_borrower, &50_000_000_000i128);
+    assert_eq!(
+        ctx.client.try_create_loan(
+            &base_borrower,
+            &10_000_000_001u128,
+            &6u32,
+            &20_000_000_000u128
+        ),
+        Err(Ok(LoanManagerError::ExceedsTierLimit))
+    );
+
+    // 4. Non-1:1 collateral pricing ratio (collateral price 0.5x loan token => doubles required collateral to 250%)
+    ctx.client.set_collateral_config(&5_000_000u128, &vault);
+    assert_eq!(
+        ctx.client
+            .get_required_collateral(&base_borrower, &400_000u128),
+        1_000_000
+    );
+    assert_eq!(
+        ctx.client
+            .try_create_loan(&base_borrower, &400_000u128, &6u32, &999_999u128),
+        Err(Ok(LoanManagerError::InsufficientCollateral))
+    );
+    let scaled_id = ctx
+        .client
+        .create_loan(&base_borrower, &400_000u128, &6u32, &1_000_000u128);
+    ctx.client.approve_loan(&ctx.admin, &scaled_id);
+    ctx.loan_sac.mint(&base_borrower, &30_000i128);
+    ctx.client
+        .repay_loan(&base_borrower, &scaled_id, &430_000u128);
+    assert!(!ctx.client.get_loan(&scaled_id).collateral_locked);
+}

@@ -356,3 +356,166 @@ fn test_vouch_expiry_pagination_and_ttl_extension() {
         assert!(ttl >= 2_500_000);
     });
 }
+
+#[test]
+fn test_adversarial_vouch_circular_sybil_and_double_withdrawal_guards() {
+    let ctx = setup();
+    let alice = Address::generate(&ctx.env);
+    let bob = Address::generate(&ctx.env);
+    let charlie = Address::generate(&ctx.env);
+    let loan_manager = Address::generate(&ctx.env);
+    let pool = Address::generate(&ctx.env);
+    ctx.client.set_loan_manager_contract(&loan_manager, &pool);
+
+    ctx.sac.mint(&alice, &2_000_000_000i128);
+    ctx.sac.mint(&bob, &2_000_000_000i128);
+    ctx.sac.mint(&charlie, &2_000_000_000i128);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&alice, &82u32);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&bob, &82u32);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&charlie, &65u32);
+
+    // 1. Self-vouch blocked
+    assert_eq!(
+        ctx.client.try_create_vouch(
+            &alice,
+            &alice,
+            &50_000u128,
+            &String::from_str(&ctx.env, "Self"),
+            &6u32,
+        ),
+        Err(Ok(VouchError::SelfVouchNotAllowed))
+    );
+
+    // 2. Mutual circular vouches Alice <-> Bob are bounded without infinite recursion or score explosion
+    let v_ab = ctx.client.create_vouch(
+        &alice,
+        &bob,
+        &100_000u128,
+        &String::from_str(&ctx.env, "Alice->Bob"),
+        &6u32,
+    );
+    let _v_ba = ctx.client.create_vouch(
+        &bob,
+        &alice,
+        &100_000u128,
+        &String::from_str(&ctx.env, "Bob->Alice"),
+        &6u32,
+    );
+    assert!(ctx.client.get_effective_vouch_trust(&v_ab) <= 100);
+
+    // 3. Duplicate active pair Alice -> Bob blocked
+    assert_eq!(
+        ctx.client.try_create_vouch(
+            &alice,
+            &bob,
+            &100_000u128,
+            &String::from_str(&ctx.env, "Dup"),
+            &6u32,
+        ),
+        Err(Ok(VouchError::DuplicateActiveVouch))
+    );
+
+    // 4. Below minimum amount and excessive duration (>24 months) rejected
+    assert_eq!(
+        ctx.client.try_create_vouch(
+            &charlie,
+            &alice,
+            &999u128,
+            &String::from_str(&ctx.env, "Tiny"),
+            &6u32,
+        ),
+        Err(Ok(VouchError::InvalidInput))
+    );
+    assert_eq!(
+        ctx.client.try_create_vouch(
+            &charlie,
+            &alice,
+            &10_000u128,
+            &String::from_str(&ctx.env, "TooLong"),
+            &25u32,
+        ),
+        Err(Ok(VouchError::InvalidInput))
+    );
+
+    // 5. Revocation cooldown enforcement and double withdrawal protection
+    ctx.client.set_revocation_cooldown(&86_400u64);
+    let v_cb = ctx.client.create_vouch(
+        &charlie,
+        &bob,
+        &200_000u128,
+        &String::from_str(&ctx.env, "Cooldown test"),
+        &6u32,
+    );
+    assert_eq!(
+        ctx.client.try_revoke_vouch(&charlie, &v_cb),
+        Err(Ok(VouchError::CooldownActive))
+    );
+    ctx.env.ledger().with_mut(|li| {
+        li.timestamp += 86_400;
+    });
+    assert_eq!(ctx.client.revoke_vouch(&charlie, &v_cb), 200_000);
+    // Double withdrawal on already refunded vouch must fail
+    assert_eq!(
+        ctx.client.try_withdraw_remaining_escrow(&charlie, &v_cb),
+        Err(Ok(VouchError::VouchAlreadyWithdrawn))
+    );
+
+    // 6. Slashing Bob's vouchees isolates Bob's vouchers and leaves unrelated active vouches intact
+    let bob_pre_slash_v = ctx.client.get_vouch(&_v_ba);
+    assert!(bob_pre_slash_v.is_active);
+    let slashed_on_bob = ctx.client.slash_vouches_on_default(&bob, &500_000u128);
+    assert_eq!(slashed_on_bob, 50_000); // 50% of Alice->Bob 100_000
+    assert_eq!(ctx.client.withdraw_remaining_escrow(&alice, &v_ab), 50_000);
+    // Double withdraw blocked after slash reclaim
+    assert_eq!(
+        ctx.client.try_withdraw_remaining_escrow(&alice, &v_ab),
+        Err(Ok(VouchError::VouchAlreadyWithdrawn))
+    );
+    // Bob -> Alice remains untouched and active
+    assert!(ctx.client.get_vouch(&_v_ba).is_active);
+    assert_eq!(ctx.client.get_vouch(&_v_ba).escrowed_balance, 100_000);
+}
+
+#[test]
+fn test_multi_voucher_sequential_slashing_and_admin_expiry() {
+    let ctx = setup();
+    let voucher1 = Address::generate(&ctx.env);
+    let voucher2 = Address::generate(&ctx.env);
+    let borrower = Address::generate(&ctx.env);
+    let loan_manager = Address::generate(&ctx.env);
+    let pool = Address::generate(&ctx.env);
+
+    ctx.client.set_loan_manager_contract(&loan_manager, &pool);
+    ctx.sac.mint(&voucher1, &100_000i128);
+    ctx.sac.mint(&voucher2, &200_000i128);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&voucher1, &80u32);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&voucher2, &80u32);
+
+    let v1 = ctx.client.create_vouch(
+        &voucher1,
+        &borrower,
+        &100_000u128,
+        &String::from_str(&ctx.env, "Voucher 1"),
+        &6u32,
+    );
+    let v2 = ctx.client.create_vouch(
+        &voucher2,
+        &borrower,
+        &200_000u128,
+        &String::from_str(&ctx.env, "Voucher 2"),
+        &6u32,
+    );
+
+    // Uncovered loss of 120_000 takes max 50% (50_000) from v1 + remaining 70_000 from v2 (<=50% of 200k)
+    let slashed = ctx.client.slash_vouches_on_default(&borrower, &120_000u128);
+    assert_eq!(slashed, 120_000);
+    assert_eq!(ctx.token.balance(&pool), 120_000);
+
+    // Remaining escrows (50_000 & 130_000) reclaimed independently without cross-leakage
+    assert_eq!(ctx.client.withdraw_remaining_escrow(&voucher1, &v1), 50_000);
+    assert_eq!(
+        ctx.client.withdraw_remaining_escrow(&voucher2, &v2),
+        130_000
+    );
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
