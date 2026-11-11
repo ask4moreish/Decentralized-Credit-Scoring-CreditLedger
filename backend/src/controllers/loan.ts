@@ -4,302 +4,434 @@ import { stellarService } from '../services/stellarService';
 import { redisCache } from '../config/redis';
 import { dbService } from '../services/dbService';
 import { logger } from '../utils/logger';
-import { authMiddleware } from '../middleware/auth';
+import { authMiddleware, requireAdmin, requireRoles } from '../middleware/auth';
+import { idempotencyMiddleware } from '../middleware/idempotency';
+import { parseDecimalToStroops, parseNonNegativeStroops, formatStroopsToDecimal } from '../utils/amounts';
 
 const router = Router();
 
-// Validation middleware
 const createLoanValidation = [
   body('borrowerPublicKey').isString().isLength({ min: 56, max: 56 }),
-  body('amount').isNumeric().isFloat({ min: 0.01 }),
+  body('amount').notEmpty(),
   body('durationMonths').isInt({ min: 1, max: 60 }),
+  body('collateralAmount').optional(),
 ];
 
 const repayLoanValidation = [
-  body('loanId').isNumeric(),
-  body('amount').isNumeric().isFloat({ min: 0.01 }),
+  body('loanId').isInt({ min: 1 }),
+  body('amount').notEmpty(),
 ];
 
-// POST /api/loans/prepare-apply
-// Generates unsigned transaction XDR for non-custodial loan application via Freighter
-router.post('/prepare-apply', authMiddleware, createLoanValidation, async (req: Request, res: Response) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+const poolAmountValidation = [
+  body('lenderPublicKey').isString().isLength({ min: 56, max: 56 }),
+  body('amount').notEmpty(),
+];
+
+function serializeChainObject(obj: any): any {
+  if (typeof obj === 'bigint') return obj.toString();
+  if (Array.isArray(obj)) return obj.map(serializeChainObject);
+  if (obj && typeof obj === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      out[k] = serializeChainObject(v);
     }
-
-    const { borrowerPublicKey, amount, durationMonths } = req.body;
-
-    if (req.user?.publicKey !== borrowerPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to prepare loan application for this user' });
-    }
-
-    const canBorrow = await stellarService.canBorrow(borrowerPublicKey, amount.toString());
-    if (!canBorrow) {
-      return res.status(400).json({ error: 'User not eligible for loan under current scoring and limits' });
-    }
-
-    const unsignedXdr = await stellarService.prepareCreateLoanTx(borrowerPublicKey, amount.toString(), durationMonths);
-
-    res.json({
-      success: true,
-      xdr: unsignedXdr,
-      message: 'Unsigned loan application prepared. Sign with Freighter wallet.',
-    });
-  } catch (error) {
-    logger.error('Error preparing loan application:', error);
-    res.status(500).json({ error: 'Failed to prepare loan application' });
+    return out;
   }
-});
+  return obj;
+}
+
+// POST /api/loans/prepare-deposit (Lender Role)
+router.post(
+  '/prepare-deposit',
+  authMiddleware,
+  requireRoles('lender', 'admin'),
+  idempotencyMiddleware,
+  poolAmountValidation,
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { lenderPublicKey, amount } = req.body;
+      if (req.user?.publicKey !== lenderPublicKey && !req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized to prepare deposit for this lender' });
+      }
+      const amountStroops = parseDecimalToStroops(amount);
+      const unsignedXdr = await stellarService.prepareDepositLiquidityTx(lenderPublicKey, amountStroops);
+      res.json({
+        success: true,
+        xdr: unsignedXdr,
+        amountStroops,
+        message: 'Unsigned liquidity deposit transaction prepared. Sign with Freighter.',
+      });
+    } catch (error) {
+      logger.error('Error preparing deposit transaction:', error);
+      res.status(500).json({ error: 'Failed to prepare liquidity deposit' });
+    }
+  }
+);
+
+// POST /api/loans/prepare-withdraw (Lender Role)
+router.post(
+  '/prepare-withdraw',
+  authMiddleware,
+  requireRoles('lender', 'admin'),
+  idempotencyMiddleware,
+  poolAmountValidation,
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { lenderPublicKey, amount } = req.body;
+      if (req.user?.publicKey !== lenderPublicKey && !req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized to prepare withdrawal for this lender' });
+      }
+      const amountStroops = parseDecimalToStroops(amount);
+      const unsignedXdr = await stellarService.prepareWithdrawLiquidityTx(lenderPublicKey, amountStroops);
+      res.json({
+        success: true,
+        xdr: unsignedXdr,
+        amountStroops,
+        message: 'Unsigned liquidity withdrawal prepared. Sign with Freighter.',
+      });
+    } catch (error) {
+      logger.error('Error preparing withdrawal transaction:', error);
+      res.status(500).json({ error: 'Failed to prepare liquidity withdrawal' });
+    }
+  }
+);
+
+// POST /api/loans/prepare-apply (Borrower Role — strict non-custodial XDR prep)
+router.post(
+  '/prepare-apply',
+  authMiddleware,
+  idempotencyMiddleware,
+  createLoanValidation,
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { borrowerPublicKey, amount, durationMonths, collateralAmount } = req.body;
+      if (req.user?.publicKey !== borrowerPublicKey && !req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized to prepare loan application for this user' });
+      }
+
+      const amountStroops = parseDecimalToStroops(amount);
+      const collateralStroops = parseNonNegativeStroops(collateralAmount);
+
+      const canBorrow = await stellarService.canBorrow(borrowerPublicKey, amountStroops);
+      if (!canBorrow) {
+        return res.status(400).json({ error: 'User not eligible for loan under current verified scoring and limits' });
+      }
+
+      const requiredCollateral = await stellarService
+        .getRequiredCollateral(borrowerPublicKey, amountStroops)
+        .catch(() => '0');
+      if (BigInt(collateralStroops) < BigInt(requiredCollateral || '0')) {
+        return res.status(400).json({
+          error: `Insufficient collateral: minimum required ${formatStroopsToDecimal(requiredCollateral)} (${requiredCollateral} stroops)`,
+          requiredCollateralStroops: requiredCollateral,
+        });
+      }
+
+      const unsignedXdr = await stellarService.prepareCreateLoanTx(
+        borrowerPublicKey,
+        amountStroops,
+        Number(durationMonths),
+        collateralStroops
+      );
+
+      res.json({
+        success: true,
+        xdr: unsignedXdr,
+        amountStroops,
+        collateralStroops,
+        requiredCollateralStroops: requiredCollateral,
+        message: 'Unsigned loan application prepared. Sign with Freighter wallet.',
+      });
+    } catch (error) {
+      logger.error('Error preparing loan application:', error);
+      res.status(500).json({ error: 'Failed to prepare loan application' });
+    }
+  }
+);
+
+// POST /api/loans/prepare-cancel
+router.post(
+  '/prepare-cancel',
+  authMiddleware,
+  idempotencyMiddleware,
+  [body('loanId').isInt({ min: 1 })],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const loanId = Number(req.body.loanId);
+      const loanRes = await stellarService.getLoan(loanId);
+      const loan = loanRes.returnValue;
+      if (loan && loan.borrower !== req.user?.publicKey && !req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized to cancel this loan' });
+      }
+      const borrowerKey = loan?.borrower || req.user!.publicKey;
+      const unsignedXdr = await stellarService.prepareCancelLoanTx(borrowerKey, loanId);
+      res.json({ success: true, xdr: unsignedXdr });
+    } catch (error) {
+      logger.error('Error preparing loan cancellation:', error);
+      res.status(500).json({ error: 'Failed to prepare loan cancellation' });
+    }
+  }
+);
 
 // POST /api/loans/prepare-repay
-// Generates unsigned transaction XDR for non-custodial repayment via Freighter
-router.post('/prepare-repay', authMiddleware, repayLoanValidation, async (req: Request, res: Response) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+router.post(
+  '/prepare-repay',
+  authMiddleware,
+  idempotencyMiddleware,
+  repayLoanValidation,
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const { loanId, amount } = req.body;
+      const { loanId, amount } = req.body;
+      const amountStroops = parseDecimalToStroops(amount);
+      const loanResult = await stellarService.getLoan(Number(loanId));
+      const loan = loanResult.returnValue;
+      if (loan && loan.borrower !== req.user?.publicKey && !req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized to repay this loan' });
+      }
 
-    const loanResult = await stellarService.getLoan(parseInt(loanId));
-    const loan = loanResult.returnValue;
-    if (loan && loan.borrower !== req.user?.publicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to repay this loan' });
-    }
+      const borrowerKey = loan?.borrower || req.user!.publicKey;
+      const unsignedXdr = await stellarService.prepareRepayLoanTx(borrowerKey, Number(loanId), amountStroops);
 
-    const borrowerKey = loan?.borrower || req.user?.publicKey;
-    const unsignedXdr = await stellarService.prepareRepayLoanTx(borrowerKey, parseInt(loanId), amount.toString());
-
-    res.json({
-      success: true,
-      xdr: unsignedXdr,
-      message: 'Unsigned repayment transaction prepared. Sign with Freighter wallet.',
-    });
-  } catch (error) {
-    logger.error('Error preparing loan repayment:', error);
-    res.status(500).json({ error: 'Failed to prepare loan repayment' });
-  }
-});
-
-// POST /api/loans/submit
-// Submits a signed loan transaction XDR
-router.post('/submit', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const { signedXDR, loanId, borrowerPublicKey, action } = req.body;
-    if (!signedXDR) {
-      return res.status(400).json({ error: 'signedXDR is required' });
-    }
-
-    const result = await stellarService.submitTransaction(signedXDR);
-
-    if (action === 'apply' && result.returnValue) {
-      const newId = result.returnValue;
-      await dbService.upsertLoan({
-        id: newId,
-        borrowerPublicKey: borrowerPublicKey || req.user?.publicKey || '',
-        amount: req.body.amount || 0,
-        interestRate: 0,
-        durationMonths: req.body.durationMonths || 12,
-        status: 'pending',
+      res.json({
+        success: true,
+        xdr: unsignedXdr,
+        amountStroops,
+        message: 'Unsigned repayment transaction prepared. Sign with Freighter wallet.',
       });
-    } else if (action === 'repay' && loanId) {
-      await dbService.updateLoanStatus(loanId, 'active', req.body.amount);
-      await redisCache.del(`loan:${loanId}`);
+    } catch (error) {
+      logger.error('Error preparing loan repayment:', error);
+      res.status(500).json({ error: 'Failed to prepare loan repayment' });
     }
+  }
+);
 
-    if (borrowerPublicKey) {
-      await redisCache.del(`loans:user:${borrowerPublicKey}`);
+// POST /api/loans/submit — Confirms transaction on Soroban BEFORE mutating DB
+router.post(
+  '/submit',
+  authMiddleware,
+  idempotencyMiddleware,
+  [
+    body('signedXDR').isString().notEmpty(),
+    body('action').isIn(['apply', 'cancel', 'repay', 'deposit', 'withdraw']),
+    body('loanId').optional().isInt({ min: 1 }),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { signedXDR, loanId, borrowerPublicKey, action } = req.body;
+
+      const result = await stellarService.submitTransaction(signedXDR);
+      const actor = borrowerPublicKey || req.user!.publicKey;
+      const amountStroops = req.body.amount ? parseNonNegativeStroops(req.body.amount) : '0';
+
+      await dbService.recordStellarTx({
+        txHash: result.hash,
+        operationType: `loan_${action}`,
+        actorPublicKey: actor,
+        status: 'confirmed',
+        ledgerSequence: result.ledger,
+        amountStroops,
+      });
+
+      if (action === 'apply' && result.returnValue) {
+        const newId = Number(result.returnValue);
+        const onChainLoan = await stellarService.getLoan(newId).catch(() => ({ returnValue: null }));
+        const l = onChainLoan.returnValue;
+        await dbService.upsertLoan({
+          id: newId,
+          borrowerPublicKey: actor,
+          amount: l?.amount ? String(l.amount) : amountStroops,
+          interestRate: l?.interest_rate ? Number(l.interest_rate) : 0,
+          durationMonths: Number(req.body.durationMonths || l?.duration_months || 12),
+          status: 'pending',
+          creditScoreUsed: Number(l?.credit_score_used || 0),
+          collateralAmount: l?.collateral_amount ? String(l.collateral_amount) : '0',
+          collateralLocked: Boolean(l?.collateral_locked),
+          scheduledInterest: l?.scheduled_interest ? String(l.scheduled_interest) : '0',
+          txHash: result.hash,
+        });
+      } else if (action === 'cancel' && loanId) {
+        await dbService.updateLoanStatus(loanId, 'cancelled', undefined, false);
+        await redisCache.del(`loan:${loanId}`);
+      } else if (action === 'repay' && loanId) {
+        const updated = await stellarService.getLoan(Number(loanId)).catch(() => ({ returnValue: null }));
+        const l = updated.returnValue;
+        const newStatus =
+          l?.status === 'Repaid' || result.returnValue?.status === 'Repaid' ? 'repaid' : 'active';
+        await dbService.updateLoanStatus(
+          loanId,
+          newStatus,
+          l?.repaid_amount ? String(l.repaid_amount) : amountStroops,
+          Boolean(l?.collateral_locked)
+        );
+        await redisCache.del(`loan:${loanId}`);
+        await redisCache.del(`credit_score:${actor}`);
+      }
+
+      await redisCache.del(`loans:user:${actor}`);
+      await redisCache.del('loans:active');
+
+      await dbService.recordAuditLog({
+        actorPublicKey: req.user!.publicKey,
+        action: `loan_${action}_confirmed`,
+        resourceType: 'loan',
+        resourceId: String(loanId || result.returnValue || result.hash),
+        status: 'confirmed',
+        details: { txHash: result.hash, ledger: result.ledger },
+      });
+
+      res.json({
+        success: true,
+        transactionHash: result.hash,
+        ledger: result.ledger,
+        data: serializeChainObject(result.returnValue),
+        message: 'Transaction confirmed on Stellar Soroban and reconciled.',
+      });
+    } catch (error) {
+      logger.error('Error submitting loan transaction:', error);
+      res.status(500).json({ error: 'Failed to submit and confirm loan transaction' });
     }
+  }
+);
 
+// GET /api/loans/pool — Lending pool reserve & liquidity summary
+router.get('/pool', authMiddleware, async (_req: Request, res: Response) => {
+  try {
+    const pool = await stellarService.getPoolState();
+    const raw = serializeChainObject(pool.returnValue || {});
     res.json({
       success: true,
-      transactionHash: result.hash,
-      data: result.returnValue,
-      message: 'Transaction submitted successfully to Stellar network',
+      data: {
+        totalShares: String(raw.total_shares ?? '0'),
+        availableCashStroops: String(raw.available_cash ?? '0'),
+        availableCash: formatStroopsToDecimal(raw.available_cash ?? '0'),
+        outstandingPrincipalStroops: String(raw.outstanding_principal ?? '0'),
+        outstandingPrincipal: formatStroopsToDecimal(raw.outstanding_principal ?? '0'),
+        totalInterestEarnedStroops: String(raw.total_interest_earned ?? '0'),
+        totalCollateralLockedStroops: String(raw.total_collateral_locked ?? '0'),
+        totalDefaultedPrincipalStroops: String(raw.total_defaulted_principal ?? '0'),
+        totalRecoveredStroops: String(raw.total_recovered ?? '0'),
+      },
     });
   } catch (error) {
-    logger.error('Error submitting loan transaction:', error);
-    res.status(500).json({ error: 'Failed to submit loan transaction' });
+    logger.error('Error fetching pool status:', error);
+    res.status(500).json({ error: 'Failed to fetch lending pool state' });
   }
 });
 
-// POST /api/loans/apply
-// Create loan application (custodial/direct fallback)
-router.post('/apply', authMiddleware, createLoanValidation, async (req: Request, res: Response) => {
+// GET /api/loans/lender/:lenderPublicKey
+router.get('/lender/:lenderPublicKey', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+    const { lenderPublicKey } = req.params;
+    if (req.user?.publicKey !== lenderPublicKey && !req.user?.isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized to view lender position' });
     }
-
-    const { borrowerPublicKey, amount, durationMonths } = req.body;
-
-    if (req.user?.publicKey !== borrowerPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to create loan for this user' });
-    }
-
-    const canBorrow = await stellarService.canBorrow(borrowerPublicKey, amount.toString());
-    if (!canBorrow) {
-      return res.status(400).json({ error: 'User not eligible for loan' });
-    }
-
-    const result = await stellarService.createLoan(borrowerPublicKey, amount.toString(), durationMonths);
-    const loanId = result.returnValue || Date.now();
-
-    // Persist to PostgreSQL
-    await dbService.upsertLoan({
-      id: loanId,
-      borrowerPublicKey,
-      amount,
-      interestRate: 10,
-      durationMonths,
-      status: 'pending',
+    const balanceStroops = await stellarService.getLenderBalance(lenderPublicKey);
+    res.json({
+      success: true,
+      data: {
+        lenderPublicKey,
+        balanceStroops,
+        balanceFormatted: formatStroopsToDecimal(balanceStroops),
+      },
     });
+  } catch (error) {
+    logger.error('Error fetching lender balance:', error);
+    res.status(500).json({ error: 'Failed to fetch lender position' });
+  }
+});
 
-    // Cache in Redis
-    const loanApplication = {
-      id: loanId,
-      borrowerPublicKey,
-      amount,
-      durationMonths,
-      status: 'pending',
-      createdAt: new Date().toISOString(),
-    };
-    await redisCache.set(`loan:application:${loanId}`, loanApplication, 3600);
-    await redisCache.del(`loans:user:${borrowerPublicKey}`);
+// POST /api/loans/check-eligibility
+router.post('/check-eligibility', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { userPublicKey, amount } = req.body;
+    if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized to check eligibility for this user' });
+    }
 
-    logger.info(`Loan application created: ${loanId} for user ${borrowerPublicKey}`);
+    const amountStroops = parseDecimalToStroops(amount);
+    const canBorrow = await stellarService.canBorrow(userPublicKey, amountStroops);
+    let creditScoreVal = 0;
+    try {
+      const cs = await stellarService.getCreditScore(userPublicKey);
+      creditScoreVal = Number(cs.returnValue?.score ?? 0);
+    } catch {
+      const dbScore = await dbService.getCachedCreditScore(userPublicKey);
+      creditScoreVal = dbScore?.score || 0;
+    }
+
+    const requiredCollateralStroops = canBorrow
+      ? await stellarService.getRequiredCollateral(userPublicKey, amountStroops).catch(() => '0')
+      : '0';
 
     res.json({
       success: true,
       data: {
-        loanId,
-        transactionHash: result.hash,
-        status: 'pending',
-        message: 'Loan application submitted successfully',
+        canBorrow,
+        creditScore: creditScoreVal,
+        collateralRequired: creditScoreVal >= 50 && creditScoreVal < 60,
+        requiredCollateralStroops,
+        requiredCollateralFormatted: formatStroopsToDecimal(requiredCollateralStroops),
+        reasons: canBorrow ? [] : ['Verified credit score below 50 or tier limit exceeded'],
       },
     });
   } catch (error) {
-    logger.error('Error creating loan application:', error);
-    res.status(500).json({ error: 'Failed to create loan application' });
-  }
-});
-
-// GET /api/loans/:loanId
-// Get loan details
-router.get('/:loanId', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const { loanId } = req.params;
-
-    // 1. Check Redis cache
-    const cacheKey = `loan:${loanId}`;
-    let loan = await redisCache.get<any>(cacheKey);
-
-    // 2. Fallback to PostgreSQL
-    if (!loan) {
-      const dbLoan = await dbService.getLoanById(loanId);
-      if (dbLoan) {
-        loan = {
-          id: dbLoan.id,
-          borrower: dbLoan.borrower_public_key,
-          amount: dbLoan.amount,
-          interestRate: dbLoan.interest_rate,
-          durationMonths: dbLoan.duration_months,
-          status: dbLoan.status,
-          repaidAmount: dbLoan.repaid_amount,
-          createdAt: dbLoan.created_at,
-        };
-        await redisCache.set(cacheKey, loan, 300);
-      }
-    }
-
-    // 3. Fallback to blockchain
-    if (!loan) {
-      try {
-        const result = await stellarService.getLoan(parseInt(loanId));
-        loan = result.returnValue;
-        if (loan) {
-          await redisCache.set(cacheKey, loan, 300);
-        }
-      } catch (err) {
-        logger.warn(`Could not load loan ${loanId} from chain:`, err);
-      }
-    }
-
-    if (!loan) {
-      return res.status(404).json({ error: 'Loan not found' });
-    }
-
-    // Check authorization
-    const borrower = loan.borrower || loan.borrower_public_key;
-    if (borrower !== req.user?.publicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to view this loan' });
-    }
-
-    res.json({
-      success: true,
-      data: loan,
-    });
-  } catch (error) {
-    logger.error('Error fetching loan details:', error);
-    res.status(500).json({ error: 'Failed to fetch loan details' });
+    logger.error('Error checking eligibility:', error);
+    res.status(500).json({ error: 'Failed to check loan eligibility' });
   }
 });
 
 // GET /api/loans/user/:userPublicKey
-// Get user's loans
 router.get('/user/:userPublicKey', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { userPublicKey } = req.params;
     const { status = 'all', limit = 10, offset = 0 } = req.query;
-
     if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
       return res.status(403).json({ error: 'Unauthorized to view loans for this user' });
     }
 
-    // 1. Check Redis cache
-    const cacheKey = `loans:user:${userPublicKey}`;
-    let userLoans: any[] = (await redisCache.get<any[]>(cacheKey)) || [];
-
-    // 2. Fallback to PostgreSQL
-    if (!userLoans.length) {
-      userLoans = await dbService.getUserLoans(userPublicKey, status as string);
-      if (userLoans.length) {
-        await redisCache.set(cacheKey, userLoans, 120);
-      }
-    }
-
-    // 3. Fallback to blockchain
+    let userLoans: any[] = await dbService.getUserLoans(userPublicKey, status as string);
     if (!userLoans.length) {
       try {
-        const result = await stellarService.getUserLoans(userPublicKey);
-        userLoans = result.returnValue || [];
-        if (userLoans.length) {
-          await redisCache.set(cacheKey, userLoans, 120);
-        }
-      } catch (err) {
-        logger.warn(`Could not load loans for ${userPublicKey} from chain:`, err);
+        const idsRes = await stellarService.getUserLoans(userPublicKey);
+        const ids: any[] = Array.isArray(idsRes.returnValue) ? idsRes.returnValue : [];
+        const hydrated = await Promise.all(
+          ids.map(async (id) => {
+            const l = await stellarService.getLoan(Number(id)).catch(() => ({ returnValue: null }));
+            return l.returnValue ? serializeChainObject(l.returnValue) : null;
+          })
+        );
+        userLoans = hydrated.filter(Boolean);
+      } catch {
+        userLoans = [];
       }
     }
 
-    let filteredLoans = userLoans;
-    if (status !== 'all') {
-      filteredLoans = userLoans.filter((l: any) => l.status === status);
-    }
-
-    const startIndex = parseInt(offset as string) || 0;
-    const endIndex = startIndex + (parseInt(limit as string) || 10);
-    const paginatedLoans = filteredLoans.slice(startIndex, endIndex);
+    const filtered =
+      status === 'all'
+        ? userLoans
+        : userLoans.filter((l: any) => String(l.status).toLowerCase() === String(status).toLowerCase());
+    const startIndex = parseInt(offset as string, 10) || 0;
+    const pageLimit = Math.min(50, parseInt(limit as string, 10) || 10);
 
     res.json({
       success: true,
       data: {
-        loans: paginatedLoans,
-        total: filteredLoans.length,
-        limit: parseInt(limit as string) || 10,
+        loans: filtered.slice(startIndex, startIndex + pageLimit),
+        total: filtered.length,
+        limit: pageLimit,
         offset: startIndex,
       },
     });
@@ -309,218 +441,125 @@ router.get('/user/:userPublicKey', authMiddleware, async (req: Request, res: Res
   }
 });
 
-// POST /api/loans/:loanId/repay
-// Repay loan (custodial/direct fallback)
-router.post('/:loanId/repay', authMiddleware, repayLoanValidation, async (req: Request, res: Response) => {
+// Admin-only routes placed before /:loanId parameter matcher
+router.get('/admin/active', authMiddleware, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { loanId } = req.params;
-    const { amount } = req.body;
-
-    const loanResult = await stellarService.getLoan(parseInt(loanId));
-    const loan = loanResult.returnValue;
-
-    if (loan && loan.borrower !== req.user?.publicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to repay this loan' });
-    }
-
-    const borrowerKey = loan?.borrower || req.user?.publicKey;
-    const result = await stellarService.repayLoan(borrowerKey, parseInt(loanId), amount.toString());
-
-    // Update DB
-    await dbService.updateLoanStatus(loanId, 'active', amount);
-
-    // Invalidate caches
-    await redisCache.del(`loan:${loanId}`);
-    await redisCache.del(`loans:user:${borrowerKey}`);
-
-    logger.info(`Loan repayment processed: ${loanId}, amount: ${amount}`);
-
-    res.json({
-      success: true,
-      transactionHash: result.hash,
-      message: 'Loan repayment processed successfully',
-    });
-  } catch (error) {
-    logger.error('Error processing loan repayment:', error);
-    res.status(500).json({ error: 'Failed to process loan repayment' });
-  }
-});
-
-// GET /api/loans/admin/active
-// Get active loans (admin only)
-router.get('/admin/active', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    if (!req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
-    const { limit = 50, offset = 0 } = req.query;
-
-    const cacheKey = 'loans:active';
-    let activeLoans: any[] = (await redisCache.get<any[]>(cacheKey)) || [];
-
+    let activeLoans: any[] = await dbService.getActiveLoans();
     if (!activeLoans.length) {
-      activeLoans = await dbService.getActiveLoans();
-      if (!activeLoans.length) {
-        try {
-          const result = await stellarService.getActiveLoans();
-          activeLoans = result.returnValue || [];
-        } catch {
-          activeLoans = [];
-        }
-      }
-      if (activeLoans.length) {
-        await redisCache.set(cacheKey, activeLoans, 60);
-      }
+      const chainRes = await stellarService.getActiveLoans().catch(() => ({ returnValue: [] }));
+      activeLoans = serializeChainObject(chainRes.returnValue || []);
     }
-
-    const startIndex = parseInt(offset as string) || 0;
-    const endIndex = startIndex + (parseInt(limit as string) || 50);
-    const paginatedLoans = activeLoans.slice(startIndex, endIndex);
-
-    res.json({
-      success: true,
-      data: {
-        loans: paginatedLoans,
-        total: activeLoans.length,
-        limit: parseInt(limit as string) || 50,
-        offset: startIndex,
-      },
-    });
+    res.json({ success: true, data: { loans: activeLoans, total: activeLoans.length } });
   } catch (error) {
     logger.error('Error fetching active loans:', error);
     res.status(500).json({ error: 'Failed to fetch active loans' });
   }
 });
 
-// POST /api/loans/:loanId/approve
-// Approve loan (admin only)
-router.post('/:loanId/approve', authMiddleware, async (req: Request, res: Response) => {
+router.get('/admin/statistics', authMiddleware, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    if (!req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
-    const { loanId } = req.params;
-
-    const result = await stellarService.approveLoan(req.user.publicKey, parseInt(loanId));
-
-    await dbService.updateLoanStatus(loanId, 'active');
-    await redisCache.del(`loan:${loanId}`);
-    await redisCache.del('loans:active');
-
-    logger.info(`Loan approved: ${loanId} by admin ${req.user.publicKey}`);
-
-    res.json({
-      success: true,
-      transactionHash: result.hash,
-      message: 'Loan approved successfully',
-    });
-  } catch (error) {
-    logger.error('Error approving loan:', error);
-    res.status(500).json({ error: 'Failed to approve loan' });
-  }
-});
-
-// POST /api/loans/:loanId/default
-// Mark loan as default (admin only)
-router.post('/:loanId/default', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    if (!req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
-    const { loanId } = req.params;
-
-    const result = await stellarService.markDefault(req.user.publicKey, parseInt(loanId));
-
-    await dbService.updateLoanStatus(loanId, 'defaulted');
-    await redisCache.del(`loan:${loanId}`);
-    await redisCache.del('loans:active');
-
-    logger.info(`Loan marked as default: ${loanId} by admin ${req.user.publicKey}`);
-
-    res.json({
-      success: true,
-      transactionHash: result.hash,
-      message: 'Loan marked as default successfully',
-    });
-  } catch (error) {
-    logger.error('Error marking loan as default:', error);
-    res.status(500).json({ error: 'Failed to mark loan as default' });
-  }
-});
-
-// GET /api/loans/admin/statistics
-// Get loan statistics (admin only)
-router.get('/admin/statistics', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    if (!req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
-    let stats: any = {};
-    try {
-      const result = await stellarService.getLoanStatistics();
-      stats = result.returnValue || {};
-    } catch {
-      const active = await dbService.getActiveLoans();
-      stats = {
-        totalLoans: active.length,
-        activeCount: active.filter((l: any) => l.status === 'active').length,
-        pendingCount: active.filter((l: any) => l.status === 'pending').length,
-      };
-    }
-
-    res.json({
-      success: true,
-      data: stats,
-    });
+    const statsRes = await stellarService.getLoanStatistics().catch(() => ({ returnValue: null }));
+    res.json({ success: true, data: serializeChainObject(statsRes.returnValue || {}) });
   } catch (error) {
     logger.error('Error fetching loan statistics:', error);
     res.status(500).json({ error: 'Failed to fetch loan statistics' });
   }
 });
 
-// POST /api/loans/check-eligibility
-router.post('/check-eligibility', authMiddleware, async (req: Request, res: Response) => {
+router.post('/admin/reconcile', authMiddleware, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    const { userPublicKey, amount } = req.body;
+    const summary = await stellarService.reconcilePendingTransactions();
+    res.json({ success: true, data: summary });
+  } catch (error) {
+    logger.error('Error reconciling transactions:', error);
+    res.status(500).json({ error: 'Reconciliation failed' });
+  }
+});
 
-    if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to check eligibility for this user' });
-    }
-
-    const canBorrow = await stellarService.canBorrow(userPublicKey, amount.toString());
-
-    let creditScoreVal = 0;
-    try {
-      const creditScoreResult = await stellarService.getCreditScore(userPublicKey);
-      creditScoreVal = creditScoreResult.returnValue?.score || 0;
-    } catch {
-      const dbScore = await dbService.getCachedCreditScore(userPublicKey);
-      creditScoreVal = dbScore?.score || 0;
-    }
-
-    const eligibility = {
-      canBorrow,
-      creditScore: creditScoreVal,
-      maxLoanAmount: canBorrow ? amount : 0,
-      reasons: canBorrow ? [] : ['Credit score below required tier (minimum 50 required) or active loan exists'],
-    };
+router.post('/:loanId/approve', authMiddleware, requireAdmin, idempotencyMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { loanId } = req.params;
+    const result = await stellarService.approveLoan(req.user!.publicKey, Number(loanId));
+    await dbService.recordStellarTx({
+      txHash: result.hash,
+      operationType: 'loan_approve_disburse',
+      actorPublicKey: req.user!.publicKey,
+      status: 'confirmed',
+      ledgerSequence: result.ledger,
+    });
+    await dbService.updateLoanStatus(loanId, 'active');
+    await redisCache.del(`loan:${loanId}`);
+    await redisCache.del('loans:active');
 
     res.json({
       success: true,
-      data: eligibility,
+      transactionHash: result.hash,
+      ledger: result.ledger,
+      message: 'Loan approved and principal disbursed on-chain',
     });
   } catch (error) {
-    logger.error('Error checking loan eligibility:', error);
-    res.status(500).json({ error: 'Failed to check loan eligibility' });
+    logger.error('Error approving loan:', error);
+    res.status(500).json({ error: 'Failed to approve and disburse loan' });
+  }
+});
+
+router.post('/:loanId/default', authMiddleware, requireAdmin, idempotencyMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { loanId } = req.params;
+    const result = await stellarService.markDefault(req.user!.publicKey, Number(loanId));
+    await dbService.recordStellarTx({
+      txHash: result.hash,
+      operationType: 'loan_mark_default',
+      actorPublicKey: req.user!.publicKey,
+      status: 'confirmed',
+      ledgerSequence: result.ledger,
+    });
+    await dbService.updateLoanStatus(loanId, 'defaulted', undefined, false);
+    await redisCache.del(`loan:${loanId}`);
+    await redisCache.del('loans:active');
+
+    res.json({
+      success: true,
+      transactionHash: result.hash,
+      ledger: result.ledger,
+      message: 'Loan marked as defaulted and collateral/vouch settlements executed',
+    });
+  } catch (error) {
+    logger.error('Error marking loan default:', error);
+    res.status(500).json({ error: 'Failed to mark loan as default' });
+  }
+});
+
+// GET /api/loans/:loanId
+router.get('/:loanId', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { loanId } = req.params;
+    let loan: any = null;
+    try {
+      const chainRes = await stellarService.getLoan(Number(loanId));
+      loan = serializeChainObject(chainRes.returnValue);
+    } catch {
+      const dbLoan = await dbService.getLoanById(loanId);
+      loan = dbLoan;
+    }
+
+    if (!loan) {
+      return res.status(404).json({ error: 'Loan not found' });
+    }
+    const borrower = loan.borrower || loan.borrower_public_key;
+    if (borrower !== req.user?.publicKey && !req.user?.isAdmin) {
+      return res.status(403).json({ error: 'Unauthorized to view this loan' });
+    }
+
+    const schedule = await stellarService
+      .getRepaymentSchedule(Number(loanId))
+      .then(serializeChainObject)
+      .catch(() => null);
+
+    res.json({ success: true, data: { ...loan, repaymentSchedule: schedule } });
+  } catch (error) {
+    logger.error('Error fetching loan:', error);
+    res.status(500).json({ error: 'Failed to fetch loan details' });
   }
 });
 

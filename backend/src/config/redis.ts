@@ -43,6 +43,10 @@ export function getRedisClient(): RedisClientType {
   return redisClient;
 }
 
+export function isRedisAvailable(): boolean {
+  return Boolean(redisClient && redisClient.isOpen);
+}
+
 export async function disconnectRedis(): Promise<void> {
   try {
     if (redisClient) {
@@ -56,17 +60,28 @@ export async function disconnectRedis(): Promise<void> {
   }
 }
 
-// Redis utility functions
+const ATOMIC_GETDEL_LUA = `
+local val = redis.call('GET', KEYS[1])
+if val then
+  redis.call('DEL', KEYS[1])
+end
+return val
+`;
+
 export class RedisCache {
   private get client(): RedisClientType | null {
     return redisClient;
   }
 
-  async set(key: string, value: any, ttl?: number): Promise<void> {
+  isConnected(): boolean {
+    return Boolean(this.client && this.client.isOpen);
+  }
+
+  async set(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
     if (!this.client) return;
     const serializedValue = JSON.stringify(value);
-    if (ttl) {
-      await this.client.setEx(key, ttl, serializedValue);
+    if (ttlSeconds && ttlSeconds > 0) {
+      await this.client.setEx(key, ttlSeconds, serializedValue);
     } else {
       await this.client.set(key, serializedValue);
     }
@@ -76,12 +91,45 @@ export class RedisCache {
     if (!this.client) return null;
     const value = await this.client.get(key);
     if (!value) return null;
-    
+
     try {
       return JSON.parse(value) as T;
     } catch (error) {
       logger.error(`Error parsing Redis value for key ${key}:`, error);
       return null;
+    }
+  }
+
+  /**
+   * Atomically fetches and deletes a key in one Redis server step using GETDEL
+   * (falling back to atomic Lua script), preventing concurrent TOCTOU replay.
+   */
+  async getAndDelete<T>(key: string): Promise<T | null> {
+    if (!this.client) return null;
+
+    let raw: string | null = null;
+    const clientAny = this.client as unknown as {
+      getDel?: (k: string) => Promise<string | null>;
+      eval?: (script: string, opts: { keys: string[] }) => Promise<string | null>;
+    };
+
+    if (typeof clientAny.getDel === 'function') {
+      raw = await clientAny.getDel(key);
+    } else if (typeof clientAny.eval === 'function') {
+      raw = await clientAny.eval(ATOMIC_GETDEL_LUA, { keys: [key] });
+    } else {
+      const value = await this.client.get(key);
+      if (value) {
+        const deleted = await this.client.del(key);
+        raw = deleted > 0 ? value : null;
+      }
+    }
+
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return raw as unknown as T;
     }
   }
 
@@ -96,7 +144,7 @@ export class RedisCache {
     return result === 1;
   }
 
-  async increment(key: string, amount: number = 1): Promise<number> {
+  async increment(key: string, amount = 1): Promise<number> {
     if (!this.client) return 0;
     return await this.client.incrBy(key, amount);
   }

@@ -7,46 +7,39 @@ import { authMiddleware } from '../middleware/auth';
 
 const router = Router();
 
-// GET /api/users/:publicKey/profile
 router.get('/:publicKey/profile', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { publicKey } = req.params;
-
     if (req.user?.publicKey !== publicKey && !req.user?.isAdmin) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
     const cacheKey = `user:profile:${publicKey}`;
     let profile = await redisCache.get(cacheKey);
-
     if (!profile) {
       let creditScore: any = null;
-      let accountInfo: any = null;
-
+      let accountExists = false;
       try {
-        const creditScoreResult = await stellarService.getCreditScore(publicKey);
+        const creditScoreResult = await stellarService.getScoreBreakdown(publicKey);
         creditScore = creditScoreResult.returnValue;
       } catch {
         creditScore = await dbService.getCachedCreditScore(publicKey);
       }
-
       try {
-        accountInfo = await stellarService.getAccount(publicKey);
+        await stellarService.getAccount(publicKey);
+        accountExists = true;
       } catch {
-        accountInfo = null;
+        accountExists = false;
       }
-
-      await dbService.upsertUser(publicKey);
-
+      await dbService.upsertUser(publicKey, req.user?.role || 'borrower');
       profile = {
         publicKey,
+        role: req.user?.role || 'borrower',
         creditScore: creditScore || { score: 0 },
-        accountExists: accountInfo !== null,
+        accountExists,
       };
-
-      await redisCache.set(cacheKey, profile, 300);
+      await redisCache.set(cacheKey, profile, 120);
     }
-
     res.json({ success: true, data: profile });
   } catch (error) {
     logger.error('Error fetching user profile:', error);
@@ -54,45 +47,26 @@ router.get('/:publicKey/profile', authMiddleware, async (req: Request, res: Resp
   }
 });
 
-// GET /api/users/:publicKey/summary
 router.get('/:publicKey/summary', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { publicKey } = req.params;
-
     if (req.user?.publicKey !== publicKey && !req.user?.isAdmin) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-
-    let creditScore: any = { score: 0 };
-    let loans: any[] = [];
-    let vouches: any[] = [];
-
-    try {
-      const creditScoreResult = await stellarService.getCreditScore(publicKey);
-      creditScore = creditScoreResult.returnValue || { score: 0 };
-    } catch {
-      creditScore = await dbService.getCachedCreditScore(publicKey) || { score: 0 };
-    }
-
-    try {
-      const loansResult = await stellarService.getUserLoans(publicKey);
-      loans = loansResult.returnValue || [];
-    } catch {
-      loans = await dbService.getUserLoans(publicKey);
-    }
-
-    try {
-      const vouchesResult = await stellarService.getUserVouches(publicKey);
-      vouches = vouchesResult.returnValue || [];
-    } catch {
-      vouches = await dbService.getUserVouches(publicKey);
-    }
-
+    const [creditScore, loans, vouches] = await Promise.all([
+      stellarService
+        .getScoreBreakdown(publicKey)
+        .then((r) => r.returnValue)
+        .catch(() => dbService.getCachedCreditScore(publicKey)),
+      dbService.getUserLoans(publicKey),
+      dbService.getUserVouches(publicKey),
+    ]);
     res.json({
       success: true,
       data: {
         publicKey,
-        creditScore,
+        role: req.user?.role || 'borrower',
+        creditScore: creditScore || { score: 0 },
         loans,
         vouches,
       },

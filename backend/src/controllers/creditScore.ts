@@ -1,435 +1,634 @@
+import crypto from 'node:crypto';
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { stellarService } from '../services/stellarService';
+import { StrKey } from '@stellar/stellar-sdk';
+import { stellarService, AttestationPayloadInput } from '../services/stellarService';
 import { redisCache } from '../config/redis';
 import { dbService } from '../services/dbService';
 import { logger } from '../utils/logger';
-import { authMiddleware } from '../middleware/auth';
+import { authMiddleware, requireAdmin, requireRoles } from '../middleware/auth';
+import { idempotencyMiddleware } from '../middleware/idempotency';
+import {
+  computeRecordCommitment,
+  decryptFinancialRecord,
+  encryptFinancialRecord,
+  filterDisclosedClaims,
+} from '../services/privacyService';
+import { parseDecimalToStroops } from '../utils/amounts';
 
 const router = Router();
 
-// Validation middleware
-const paymentHistoryValidation = [
-  body('userPublicKey').isString().isLength({ min: 56, max: 56 }),
-  body('payments').isArray({ min: 1 }),
-  body('payments.*.amount').isNumeric(),
-  body('payments.*.timestamp').isNumeric(),
-  body('payments.*.paymentType').isString(),
-  body('payments.*.consistencyScore').isInt({ min: 0, max: 100 }),
-];
-
-const savingsDataValidation = [
-  body('userPublicKey').isString().isLength({ min: 56, max: 56 }),
-  body('amount').isNumeric(),
-  body('timestamp').isNumeric(),
-  body('durationMonths').isInt({ min: 1 }),
-  body('regularityScore').isInt({ min: 0, max: 100 }),
-];
-
-// POST /api/credit-score/prepare-payment-history
-// Generates unsigned XDR for non-custodial user signing with Freighter
-router.post('/prepare-payment-history', authMiddleware, paymentHistoryValidation, async (req: Request, res: Response) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { userPublicKey, payments } = req.body;
-    if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to prepare payment history for this user' });
-    }
-
-    const unsignedXdr = await stellarService.prepareUpdatePaymentHistoryTx(userPublicKey, payments);
-    res.json({
-      success: true,
-      xdr: unsignedXdr,
-      message: 'Unsigned transaction prepared. Sign with Freighter wallet.',
-    });
-  } catch (error) {
-    logger.error('Error preparing payment history transaction:', error);
-    res.status(500).json({ error: 'Failed to prepare payment history transaction' });
+function ensureOwnerOrAdmin(req: Request, res: Response, targetPublicKey: string): boolean {
+  if (!req.user) {
+    res.status(401).json({ error: 'Authentication required' });
+    return false;
   }
-});
-
-// POST /api/credit-score/prepare-savings-data
-// Generates unsigned XDR for non-custodial user signing with Freighter
-router.post('/prepare-savings-data', authMiddleware, savingsDataValidation, async (req: Request, res: Response) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { userPublicKey, amount, timestamp, durationMonths, regularityScore } = req.body;
-    if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to prepare savings data for this user' });
-    }
-
-    const unsignedXdr = await stellarService.prepareUpdateSavingsDataTx(userPublicKey, {
-      amount,
-      timestamp,
-      durationMonths,
-      regularityScore,
-    });
-
-    res.json({
-      success: true,
-      xdr: unsignedXdr,
-      message: 'Unsigned transaction prepared. Sign with Freighter wallet.',
-    });
-  } catch (error) {
-    logger.error('Error preparing savings transaction:', error);
-    res.status(500).json({ error: 'Failed to prepare savings transaction' });
+  if (req.user.publicKey !== targetPublicKey && !req.user.isAdmin) {
+    res.status(403).json({ error: 'Forbidden: cannot access or modify another user record' });
+    return false;
   }
-});
+  return true;
+}
+
+// POST /api/credit-score/issuer/register (Admin only)
+router.post(
+  '/issuer/register',
+  authMiddleware,
+  requireAdmin,
+  [
+    body('issuerPublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('category').isInt({ min: 1, max: 4 }),
+    body('name').isString().isLength({ min: 2, max: 96 }),
+    body('metadataUri').isString().isLength({ max: 200 }),
+    body('verificationKeyHex').optional().isHexadecimal().isLength({ min: 64, max: 64 }),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { issuerPublicKey, category, name, metadataUri, verificationKeyHex } = req.body;
+      if (!StrKey.isValidEd25519PublicKey(issuerPublicKey)) {
+        return res.status(400).json({ error: 'Invalid Stellar issuer public key' });
+      }
+      const result = await stellarService.registerIssuer({
+        issuerPublicKey,
+        category,
+        name,
+        metadataUri,
+        verificationKeyHex,
+      });
+      await dbService.recordAuditLog({
+        actorPublicKey: req.user!.publicKey,
+        action: 'issuer_registered',
+        resourceType: 'issuer',
+        resourceId: issuerPublicKey,
+        status: 'confirmed',
+      });
+      res.json({ success: true, transactionHash: result.hash });
+    } catch (error) {
+      logger.error('Error registering issuer:', error);
+      res.status(500).json({ error: 'Failed to register issuer' });
+    }
+  }
+);
+
+// POST /api/credit-score/issuer/revoke (Admin only)
+router.post(
+  '/issuer/revoke',
+  authMiddleware,
+  requireAdmin,
+  [body('issuerPublicKey').isString().isLength({ min: 56, max: 56 })],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { issuerPublicKey } = req.body;
+      const result = await stellarService.revokeIssuer(issuerPublicKey);
+      await dbService.recordAuditLog({
+        actorPublicKey: req.user!.publicKey,
+        action: 'issuer_revoked',
+        resourceType: 'issuer',
+        resourceId: issuerPublicKey,
+        status: 'confirmed',
+      });
+      res.json({ success: true, transactionHash: result.hash });
+    } catch (error) {
+      logger.error('Error revoking issuer:', error);
+      res.status(500).json({ error: 'Failed to revoke issuer' });
+    }
+  }
+);
+
+// POST /api/credit-score/attestations/prepare
+// Prepares an unsigned non-custodial transaction for an authorized Ed25519-signed attestation
+router.post(
+  '/attestations/prepare',
+  authMiddleware,
+  idempotencyMiddleware,
+  [
+    body('subjectPublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('issuerPublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('kind').isInt({ min: 1, max: 2 }),
+    body('metricScore').isInt({ min: 0, max: 100 }),
+    body('amount').notEmpty(),
+    body('durationMonths').isInt({ min: 0, max: 120 }),
+    body('issuedAt').isInt({ min: 1 }),
+    body('expiresAt').isInt({ min: 2 }),
+    body('signatureHex').isHexadecimal().isLength({ min: 128, max: 128 }),
+    body('attestationIdHex').isHexadecimal().isLength({ min: 64, max: 64 }),
+    body('recordCommitmentHex').isHexadecimal().isLength({ min: 64, max: 64 }),
+    body('rawFinancialDetails').optional().isObject(),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const {
+        subjectPublicKey,
+        issuerPublicKey,
+        kind,
+        metricScore,
+        amount,
+        durationMonths,
+        issuedAt,
+        expiresAt,
+        signatureHex,
+        attestationIdHex,
+        recordCommitmentHex,
+        rawFinancialDetails,
+      } = req.body;
+
+      if (!ensureOwnerOrAdmin(req, res, subjectPublicKey)) return;
+
+      const amountStroops = parseDecimalToStroops(amount);
+      const input: AttestationPayloadInput = {
+        attestationIdHex,
+        subjectPublicKey,
+        kind,
+        recordCommitmentHex,
+        metricScore,
+        amountUnits: amountStroops,
+        durationMonths,
+        issuedAt: Number(issuedAt),
+        expiresAt: Number(expiresAt),
+      };
+
+      const unsignedXdr = await stellarService.prepareSubmitSignedAttestationTx(
+        subjectPublicKey,
+        issuerPublicKey,
+        input,
+        signatureHex
+      );
+
+      // Encrypt optional off-chain evidence at rest via AES-256-GCM before persisting
+      if (rawFinancialDetails) {
+        const encrypted = encryptFinancialRecord(rawFinancialDetails);
+        await dbService.storeEncryptedRecord({
+          id: attestationIdHex,
+          ownerPublicKey: subjectPublicKey,
+          issuerPublicKey,
+          attestationId: attestationIdHex,
+          recordKind: kind === 1 ? 'payment' : 'savings',
+          recordCommitment: recordCommitmentHex,
+          ciphertext: encrypted.ciphertext,
+          iv: encrypted.iv,
+          authTag: encrypted.authTag,
+          verified: true,
+          expiresAt: new Date(Number(expiresAt) * 1000),
+        });
+      }
+
+      res.json({
+        success: true,
+        xdr: unsignedXdr,
+        attestationId: attestationIdHex,
+        recordCommitment: recordCommitmentHex,
+      });
+    } catch (error) {
+      logger.error('Error preparing signed attestation tx:', error);
+      res.status(500).json({ error: 'Failed to prepare signed attestation transaction' });
+    }
+  }
+);
+
+// POST /api/credit-score/prepare-supplementary
+// Replaces insecure score-boosting self-report endpoints: only anchors non-authoritative metadata (0 score impact)
+router.post(
+  '/prepare-supplementary',
+  authMiddleware,
+  idempotencyMiddleware,
+  [
+    body('userPublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('kind').isInt({ min: 1, max: 2 }),
+    body('amount').notEmpty(),
+    body('claimedMetric').isInt({ min: 0, max: 100 }),
+    body('durationMonths').isInt({ min: 0, max: 120 }),
+    body('recordPayload').optional().isObject(),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { userPublicKey, kind, amount, claimedMetric, durationMonths, recordPayload } = req.body;
+      if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
+
+      const timestamp = Math.floor(Date.now() / 1000);
+      const offchainDoc = {
+        ...(recordPayload || {}),
+        kind,
+        amount: String(amount),
+        claimedMetric,
+        durationMonths,
+        timestamp,
+      };
+      const recordCommitment = computeRecordCommitment(offchainDoc);
+      const encrypted = encryptFinancialRecord(offchainDoc);
+      const recordId = crypto.randomUUID();
+
+      await dbService.storeEncryptedRecord({
+        id: recordId,
+        ownerPublicKey: userPublicKey,
+        recordKind: 'supplementary',
+        recordCommitment,
+        ciphertext: encrypted.ciphertext,
+        iv: encrypted.iv,
+        authTag: encrypted.authTag,
+        verified: false,
+      });
+
+      const unsignedXdr = await stellarService.prepareSubmitSelfReportedTx(userPublicKey, {
+        kind,
+        recordCommitmentHex: recordCommitment,
+        claimedAmount: amount,
+        claimedMetric,
+        durationMonths,
+        timestamp,
+      });
+
+      res.json({
+        success: true,
+        xdr: unsignedXdr,
+        recordId,
+        recordCommitment,
+        verified: false,
+        note: 'Supplementary self-reported data does NOT contribute to authoritative credit score.',
+      });
+    } catch (error) {
+      logger.error('Error preparing supplementary transaction:', error);
+      res.status(500).json({ error: 'Failed to prepare supplementary record transaction' });
+    }
+  }
+);
 
 // POST /api/credit-score/submit-transaction
-// Submits client-signed XDR
-router.post('/submit-transaction', authMiddleware, async (req: Request, res: Response) => {
+router.post(
+  '/submit-transaction',
+  authMiddleware,
+  idempotencyMiddleware,
+  [
+    body('signedXDR').isString().notEmpty(),
+    body('userPublicKey').optional().isString().isLength({ min: 56, max: 56 }),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { signedXDR, userPublicKey } = req.body;
+      const targetUser = userPublicKey || req.user!.publicKey;
+      if (!ensureOwnerOrAdmin(req, res, targetUser)) return;
+
+      const result = await stellarService.submitTransaction(signedXDR);
+      await dbService.recordStellarTx({
+        txHash: result.hash,
+        operationType: 'credit_score_tx',
+        actorPublicKey: req.user!.publicKey,
+        status: 'confirmed',
+        ledgerSequence: result.ledger,
+      });
+
+      // Refresh cached breakdown after confirmed on-chain settlement
+      await redisCache.del(`credit_score:${targetUser}`);
+      await redisCache.del(`user:profile:${targetUser}`);
+
+      try {
+        const fresh = await stellarService.getScoreBreakdown(targetUser);
+        if (fresh.returnValue) {
+          const b = fresh.returnValue;
+          await dbService.upsertCreditScore({
+            publicKey: targetUser,
+            score: Number(b.score || 0),
+            paymentHistoryScore: Number(b.payment_history_score || 0),
+            savingsScore: Number(b.savings_score || 0),
+            repaymentScore: Number(b.repayment_score || 0),
+            communityScore: Number(b.community_score || 0),
+            activityScore: Number(b.activity_score || 0),
+            modelVersion: Number(b.model_version || 2),
+          });
+        }
+      } catch {
+        // Non-fatal if offline/mocked
+      }
+
+      res.json({
+        success: true,
+        transactionHash: result.hash,
+        ledger: result.ledger,
+        data: result.returnValue,
+      });
+    } catch (error) {
+      logger.error('Error submitting credit score transaction:', error);
+      res.status(500).json({ error: 'Failed to submit and confirm credit score transaction' });
+    }
+  }
+);
+
+// POST /api/credit-score/:userPublicKey/consent — Grant selective disclosure consent
+router.post(
+  '/:userPublicKey/consent',
+  authMiddleware,
+  [
+    body('granteePublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('scope').isArray({ min: 1 }),
+    body('recordIds').isArray(),
+    body('ttlSeconds').optional().isInt({ min: 60, max: 2592000 }),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { userPublicKey } = req.params;
+      if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
+
+      const grantId = crypto.randomUUID();
+      const ttl = Number(req.body.ttlSeconds || 86400);
+      await dbService.createConsentGrant({
+        id: grantId,
+        ownerPublicKey: userPublicKey,
+        granteePublicKey: req.body.granteePublicKey,
+        scope: req.body.scope,
+        recordIds: req.body.recordIds,
+        expiresAt: new Date(Date.now() + ttl * 1000),
+      });
+
+      res.status(201).json({ success: true, grantId, expiresInSeconds: ttl });
+    } catch (error) {
+      logger.error('Error creating consent grant:', error);
+      res.status(500).json({ error: 'Failed to create selective disclosure grant' });
+    }
+  }
+);
+
+// POST /api/credit-score/:userPublicKey/consent/:grantId/revoke
+router.post('/:userPublicKey/consent/:grantId/revoke', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const { signedXDR, userPublicKey } = req.body;
-    if (!signedXDR) {
-      return res.status(400).json({ error: 'signedXDR is required' });
-    }
-
-    const result = await stellarService.submitTransaction(signedXDR);
-
-    if (userPublicKey) {
-      await redisCache.del(`credit_score:${userPublicKey}`);
-      await redisCache.del(`user:profile:${userPublicKey}`);
-    }
-
-    res.json({
-      success: true,
-      transactionHash: result.hash,
-      data: result.returnValue,
-      message: 'Transaction submitted successfully to Stellar network',
-    });
+    const { userPublicKey, grantId } = req.params;
+    if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
+    const revoked = await dbService.revokeConsentGrant(grantId, userPublicKey);
+    if (!revoked) return res.status(404).json({ error: 'Active consent grant not found' });
+    res.json({ success: true, message: 'Consent grant revoked' });
   } catch (error) {
-    logger.error('Error submitting transaction:', error);
-    res.status(500).json({ error: 'Failed to submit transaction' });
+    logger.error('Error revoking consent grant:', error);
+    res.status(500).json({ error: 'Failed to revoke consent grant' });
   }
 });
 
-// Update payment history (custodial fallback / direct API)
-router.post('/payment-history', authMiddleware, paymentHistoryValidation, async (req: Request, res: Response) => {
+// GET /api/credit-score/:userPublicKey/disclose/:grantId — Selective disclosure read by authorized grantee
+router.get('/:userPublicKey/disclose/:grantId', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+    const { userPublicKey, grantId } = req.params;
+    const grant = await dbService.getConsentGrant(grantId);
+    if (!grant || grant.owner_public_key !== userPublicKey) {
+      return res.status(404).json({ error: 'Consent grant not found' });
+    }
+    if (grant.revoked_at || new Date(grant.expires_at).getTime() <= Date.now()) {
+      return res.status(403).json({ error: 'Consent grant expired or revoked' });
+    }
+    const requester = req.user!.publicKey;
+    if (requester !== grant.grantee_public_key && requester !== userPublicKey && !req.user!.isAdmin) {
+      return res.status(403).json({ error: 'Requester not authorized by consent grant' });
     }
 
-    const { userPublicKey, payments } = req.body;
+    const allowedFields = JSON.parse(grant.scope_json) as string[];
+    const recordIds = JSON.parse(grant.record_ids_json) as string[];
+    const encryptedRows = await dbService.getOwnerEncryptedRecords(userPublicKey, recordIds);
 
-    if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to update payment history for this user' });
-    }
-
-    const result = await stellarService.updatePaymentHistory(userPublicKey, payments);
-
-    // Cache the payments array
-    await redisCache.set(`credit_score:payment_history:${userPublicKey}`, payments, 300);
-    // Invalidate cached score
-    await redisCache.del(`credit_score:${userPublicKey}`);
-
-    logger.info(`Payment history updated for user ${userPublicKey}`);
-
-    res.json({
-      success: true,
-      transactionHash: result.hash,
-      message: 'Payment history updated successfully',
+    const disclosed = encryptedRows.map((row) => {
+      const decrypted = decryptFinancialRecord({
+        ciphertext: row.ciphertext,
+        iv: row.iv,
+        authTag: row.auth_tag,
+      });
+      return {
+        recordId: row.id,
+        recordKind: row.record_kind,
+        verified: Boolean(row.verified),
+        issuerPublicKey: row.issuer_public_key,
+        ...filterDisclosedClaims(decrypted, allowedFields, row.record_commitment),
+      };
     });
+
+    res.json({ success: true, data: disclosed });
   } catch (error) {
-    logger.error('Error updating payment history:', error);
-    res.status(500).json({ error: 'Failed to update payment history' });
+    logger.error('Error reading selectively disclosed records:', error);
+    res.status(500).json({ error: 'Failed to disclose financial evidence' });
   }
 });
 
-// Update savings data (custodial fallback / direct API)
-router.post('/savings-data', authMiddleware, savingsDataValidation, async (req: Request, res: Response) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { userPublicKey, amount, timestamp, durationMonths, regularityScore } = req.body;
-
-    if (req.user?.publicKey !== userPublicKey && !req.user?.isAdmin) {
-      return res.status(403).json({ error: 'Unauthorized to update savings data for this user' });
-    }
-
-    const savingsData = {
-      amount,
-      timestamp,
-      durationMonths,
-      regularityScore,
-    };
-
-    const result = await stellarService.updateSavingsData(userPublicKey, savingsData);
-
-    const cacheKey = `credit_score:savings:${userPublicKey}`;
-    const existingSavings = (await redisCache.get<any[]>(cacheKey)) || [];
-    existingSavings.push(savingsData);
-    await redisCache.set(cacheKey, existingSavings, 300);
-    await redisCache.del(`credit_score:${userPublicKey}`);
-
-    logger.info(`Savings data updated for user ${userPublicKey}`);
-
-    res.json({
-      success: true,
-      transactionHash: result.hash,
-      message: 'Savings data updated successfully',
-    });
-  } catch (error) {
-    logger.error('Error updating savings data:', error);
-    res.status(500).json({ error: 'Failed to update savings data' });
-  }
-});
-
-// Get credit score (0-100 scale)
-router.get('/:userPublicKey', async (req: Request, res: Response) => {
+// DELETE /api/credit-score/:userPublicKey/privacy — Off-chain PII/financial erasure policy
+router.delete('/:userPublicKey/privacy', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { userPublicKey } = req.params;
+    if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
+    const deletedCount = await dbService.deleteOwnerPrivateRecords(userPublicKey);
+    await dbService.recordAuditLog({
+      actorPublicKey: req.user!.publicKey,
+      action: 'private_records_erased',
+      resourceType: 'user',
+      resourceId: userPublicKey,
+      status: 'ok',
+      details: { deletedCount },
+    });
+    res.json({ success: true, deletedRecords: deletedCount });
+  } catch (error) {
+    logger.error('Error deleting private records:', error);
+    res.status(500).json({ error: 'Failed to delete private records' });
+  }
+});
 
-    // 1. Check Redis cache first
+// GET /api/credit-score/:userPublicKey — Authenticated owner/admin credit score
+router.get('/:userPublicKey', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { userPublicKey } = req.params;
+    if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
+
     const cacheKey = `credit_score:${userPublicKey}`;
     let creditScore = await redisCache.get<any>(cacheKey);
 
-    // 2. Fallback to PostgreSQL database cache
-    if (!creditScore) {
-      const dbScore = await dbService.getCachedCreditScore(userPublicKey);
-      if (dbScore) {
-        creditScore = {
-          score: dbScore.score,
-          payment_history_score: dbScore.payment_history_score,
-          savings_score: dbScore.savings_score,
-          community_score: dbScore.community_score,
-          activity_score: dbScore.activity_score,
-          last_updated: Math.floor(new Date(dbScore.last_updated).getTime() / 1000),
-        };
-        await redisCache.set(cacheKey, creditScore, 300);
-      }
-    }
-
-    // 3. Fallback to Stellar Soroban on-chain state
     if (!creditScore) {
       try {
-        const result = await stellarService.getCreditScore(userPublicKey);
-        creditScore = result.returnValue || {
-          score: 0,
-          payment_history_score: 0,
-          savings_score: 0,
-          community_score: 0,
-          activity_score: 0,
-          last_updated: 0,
-        };
-
-        // Normalize score values to 0-100
-        if (typeof creditScore.score === 'number') {
-          creditScore.score = Math.max(0, Math.min(100, creditScore.score));
+        const result = await stellarService.getScoreBreakdown(userPublicKey);
+        if (result.returnValue) {
+          const b = result.returnValue;
+          creditScore = {
+            model_version: Number(b.model_version ?? 2),
+            score: Math.max(0, Math.min(100, Number(b.score ?? 0))),
+            payment_history_score: Number(b.payment_history_score ?? 0),
+            savings_score: Number(b.savings_score ?? 0),
+            repayment_score: Number(b.repayment_score ?? 0),
+            community_score: Number(b.community_score ?? 0),
+            activity_score: Number(b.activity_score ?? 0),
+            default_penalty: Number(b.default_penalty ?? 0),
+            verified_payment_count: Number(b.verified_payment_count ?? 0),
+            verified_savings_count: Number(b.verified_savings_count ?? 0),
+            active_vouch_count: Number(b.active_vouch_count ?? 0),
+            self_reported_count: Number(b.self_reported_count ?? 0),
+            last_updated: Number(b.last_updated ?? 0),
+          };
+          await dbService.upsertCreditScore({
+            publicKey: userPublicKey,
+            score: creditScore.score,
+            paymentHistoryScore: creditScore.payment_history_score,
+            savingsScore: creditScore.savings_score,
+            repaymentScore: creditScore.repayment_score,
+            communityScore: creditScore.community_score,
+            activityScore: creditScore.activity_score,
+            modelVersion: creditScore.model_version,
+          });
+          await redisCache.set(cacheKey, creditScore, 120);
         }
-
-        // Persist to PostgreSQL
-        await dbService.upsertCreditScore({
-          publicKey: userPublicKey,
-          score: creditScore.score || 0,
-          paymentHistoryScore: creditScore.payment_history_score || 0,
-          savingsScore: creditScore.savings_score || 0,
-          communityScore: creditScore.community_score || 0,
-          activityScore: creditScore.activity_score || 0,
-        });
-
-        // Cache in Redis for 5 minutes
-        await redisCache.set(cacheKey, creditScore, 300);
-      } catch (chainErr) {
-        logger.warn(`Could not fetch on-chain score for ${userPublicKey}:`, chainErr);
-        // Default clean state
-        creditScore = {
-          score: 0,
-          payment_history_score: 0,
-          savings_score: 0,
-          community_score: 0,
-          activity_score: 0,
-          last_updated: 0,
-        };
+      } catch {
+        // Fallback to PostgreSQL cache if RPC unavailable
       }
     }
 
-    res.json({
-      success: true,
-      data: creditScore,
-    });
+    if (!creditScore) {
+      const dbScore = await dbService.getCachedCreditScore(userPublicKey);
+      creditScore = dbScore
+        ? {
+            model_version: dbScore.model_version ?? 2,
+            score: dbScore.score,
+            payment_history_score: dbScore.payment_history_score,
+            savings_score: dbScore.savings_score,
+            repayment_score: dbScore.repayment_score ?? 0,
+            community_score: dbScore.community_score,
+            activity_score: dbScore.activity_score,
+            last_updated: Math.floor(new Date(dbScore.last_updated).getTime() / 1000),
+          }
+        : {
+            model_version: 2,
+            score: 0,
+            payment_history_score: 0,
+            savings_score: 0,
+            repayment_score: 0,
+            community_score: 0,
+            activity_score: 0,
+            verified_payment_count: 0,
+            verified_savings_count: 0,
+            active_vouch_count: 0,
+            self_reported_count: 0,
+            last_updated: 0,
+          };
+    }
+
+    res.json({ success: true, data: creditScore });
   } catch (error) {
     logger.error('Error fetching credit score:', error);
     res.status(500).json({ error: 'Failed to fetch credit score' });
   }
 });
 
-// Get payment history
-router.get('/:userPublicKey/payment-history', async (req: Request, res: Response) => {
+// GET /api/credit-score/:userPublicKey/records — Owner decrypted records (NEVER unauthenticated)
+router.get('/:userPublicKey/records', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { userPublicKey } = req.params;
-    const { limit = 50, offset = 0 } = req.query;
+    if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
 
-    const cacheKey = `credit_score:payment_history:${userPublicKey}`;
-    let paymentHistory = (await redisCache.get<any[]>(cacheKey)) || [];
+    const encryptedRows = await dbService.getOwnerEncryptedRecords(userPublicKey);
+    const records = encryptedRows.map((row) => ({
+      id: row.id,
+      recordKind: row.record_kind,
+      verified: Boolean(row.verified),
+      issuerPublicKey: row.issuer_public_key,
+      recordCommitment: row.record_commitment,
+      expiresAt: row.expires_at,
+      createdAt: row.created_at,
+      details: decryptFinancialRecord({
+        ciphertext: row.ciphertext,
+        iv: row.iv,
+        authTag: row.auth_tag,
+      }),
+    }));
 
-    const startIndex = parseInt(offset as string) || 0;
-    const endIndex = startIndex + (parseInt(limit as string) || 50);
-    const paginatedHistory = paymentHistory.slice(startIndex, endIndex);
-
-    res.json({
-      success: true,
-      data: {
-        paymentHistory: paginatedHistory,
-        total: paymentHistory.length,
-        limit: parseInt(limit as string) || 50,
-        offset: startIndex,
-      },
-    });
+    res.json({ success: true, data: { records, total: records.length } });
   } catch (error) {
-    logger.error('Error fetching payment history:', error);
-    res.status(500).json({ error: 'Failed to fetch payment history' });
+    logger.error('Error fetching owner encrypted records:', error);
+    res.status(500).json({ error: 'Failed to fetch financial records' });
   }
 });
 
-// Get savings data
-router.get('/:userPublicKey/savings-data', async (req: Request, res: Response) => {
+// GET /api/credit-score/:userPublicKey/breakdown
+router.get('/:userPublicKey/breakdown', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { userPublicKey } = req.params;
-    const { limit = 50, offset = 0 } = req.query;
+    if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
 
-    const cacheKey = `credit_score:savings:${userPublicKey}`;
-    let savingsData = (await redisCache.get<any[]>(cacheKey)) || [];
-
-    const startIndex = parseInt(offset as string) || 0;
-    const endIndex = startIndex + (parseInt(limit as string) || 50);
-    const paginatedSavings = savingsData.slice(startIndex, endIndex);
-
-    res.json({
-      success: true,
-      data: {
-        savingsData: paginatedSavings,
-        total: savingsData.length,
-        limit: parseInt(limit as string) || 50,
-        offset: startIndex,
-      },
-    });
-  } catch (error) {
-    logger.error('Error fetching savings data:', error);
-    res.status(500).json({ error: 'Failed to fetch savings data' });
-  }
-});
-
-// Get credit score breakdown
-router.get('/:userPublicKey/breakdown', async (req: Request, res: Response) => {
-  try {
-    const { userPublicKey } = req.params;
-
-    let creditScore: any = null;
+    let raw: any = null;
     try {
-      const creditScoreResult = await stellarService.getCreditScore(userPublicKey);
-      creditScore = creditScoreResult.returnValue;
+      const resChain = await stellarService.getScoreBreakdown(userPublicKey);
+      raw = resChain.returnValue;
     } catch {
-      const dbScore = await dbService.getCachedCreditScore(userPublicKey);
-      creditScore = dbScore || { score: 0 };
+      raw = await dbService.getCachedCreditScore(userPublicKey);
     }
 
-    const [paymentHistory, savingsData] = await Promise.all([
-      redisCache.get<any[]>(`credit_score:payment_history:${userPublicKey}`).then((v) => v || []),
-      redisCache.get<any[]>(`credit_score:savings:${userPublicKey}`).then((v) => v || []),
-    ]);
-
-    const breakdown = {
-      paymentHistory: {
-        score: Math.min(100, Math.max(0, creditScore?.payment_history_score || 0)),
-        count: paymentHistory.length,
-        totalAmount: paymentHistory.reduce((sum: number, payment: any) => sum + parseFloat(payment.amount || 0), 0),
-        averageConsistency:
-          paymentHistory.length > 0
-            ? paymentHistory.reduce((sum: number, payment: any) => sum + (payment.consistencyScore || 0), 0) / paymentHistory.length
-            : 0,
-      },
-      savings: {
-        score: Math.min(100, Math.max(0, creditScore?.savings_score || 0)),
-        count: savingsData.length,
-        totalAmount: savingsData.reduce((sum: number, savings: any) => sum + parseFloat(savings.amount || 0), 0),
-        averageDuration:
-          savingsData.length > 0
-            ? savingsData.reduce((sum: number, savings: any) => sum + (savings.durationMonths || 0), 0) / savingsData.length
-            : 0,
-      },
-      community: {
-        score: Math.min(100, Math.max(0, creditScore?.community_score || 0)),
-      },
-      activity: {
-        score: Math.min(100, Math.max(0, creditScore?.activity_score || 0)),
-      },
-      overall: {
-        score: Math.min(100, Math.max(0, creditScore?.score || 0)),
-        lastUpdated: creditScore?.last_updated || Date.now(),
-      },
-    };
-
     res.json({
       success: true,
-      data: breakdown,
+      data: {
+        modelVersion: Number(raw?.model_version ?? 2),
+        overallScore: Number(raw?.score ?? 0),
+        defaultPenalty: Number(raw?.default_penalty ?? 0),
+        pillars: {
+          paymentHistory: {
+            score: Number(raw?.payment_history_score ?? 0),
+            weightPct: Number(raw?.weight_payment ?? 35),
+            verifiedCount: Number(raw?.verified_payment_count ?? 0),
+          },
+          savings: {
+            score: Number(raw?.savings_score ?? 0),
+            weightPct: Number(raw?.weight_savings ?? 25),
+            verifiedCount: Number(raw?.verified_savings_count ?? 0),
+          },
+          repayment: {
+            score: Number(raw?.repayment_score ?? 0),
+            weightPct: Number(raw?.weight_repayment ?? 20),
+            repaidLoans: Number(raw?.repaid_loans ?? 0),
+            defaultedLoans: Number(raw?.defaulted_loans ?? 0),
+          },
+          community: {
+            score: Number(raw?.community_score ?? 0),
+            weightPct: Number(raw?.weight_community ?? 10),
+            activeVouches: Number(raw?.active_vouch_count ?? 0),
+          },
+          activity: {
+            score: Number(raw?.activity_score ?? 0),
+            weightPct: Number(raw?.weight_activity ?? 10),
+          },
+        },
+        supplementary: {
+          selfReportedCount: Number(raw?.self_reported_count ?? 0),
+          weightPct: 0,
+        },
+      },
     });
   } catch (error) {
-    logger.error('Error fetching credit score breakdown:', error);
+    logger.error('Error fetching breakdown:', error);
     res.status(500).json({ error: 'Failed to fetch credit score breakdown' });
   }
 });
 
-// Get credit score trends (0-100 scale)
-router.get('/:userPublicKey/trends', async (req: Request, res: Response) => {
+// GET /api/credit-score/:userPublicKey/trends — Real recorded snapshots (no fabricated synthetic math)
+router.get('/:userPublicKey/trends', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { userPublicKey } = req.params;
-    const { period = '30d' } = req.query;
+    if (!ensureOwnerOrAdmin(req, res, userPublicKey)) return;
 
-    // Fetch actual current score
-    let currentScore = 0;
-    const dbScore = await dbService.getCachedCreditScore(userPublicKey);
-    if (dbScore) {
-      currentScore = dbScore.score;
-    } else {
-      try {
-        const chainScore = await stellarService.getCreditScore(userPublicKey);
-        currentScore = chainScore.returnValue?.score || 0;
-      } catch {
-        currentScore = 0;
-      }
-    }
-
-    currentScore = Math.max(0, Math.min(100, currentScore));
-    const previousScore = Math.max(0, currentScore - 3);
-    const change = currentScore - previousScore;
-    const changePercent = previousScore > 0 ? parseFloat(((change / previousScore) * 100).toFixed(2)) : 0;
-
-    const today = new Date();
-    const dailyScores = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      const isoDate = d.toISOString().split('T')[0];
-      const variance = Math.round((6 - i) * 0.5);
-      dailyScores.push({
-        date: isoDate,
-        score: Math.max(0, Math.min(100, currentScore - (3 - variance))),
-      });
-    }
+    const history = await dbService.getScoreHistory(userPublicKey, 30);
+    const ordered = [...history].sort(
+      (a, b) => new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime()
+    );
+    const currentScore = ordered.length > 0 ? Number(ordered[ordered.length - 1].score) : 0;
+    const previousScore = ordered.length > 1 ? Number(ordered[ordered.length - 2].score) : currentScore;
 
     res.json({
       success: true,
       data: {
-        period,
         currentScore,
         previousScore,
-        change,
-        changePercent,
-        dailyScores,
+        change: currentScore - previousScore,
+        snapshots: ordered.map((row) => ({
+          date: new Date(row.recorded_at).toISOString(),
+          score: Number(row.score),
+          modelVersion: Number(row.model_version ?? 2),
+        })),
       },
     });
   } catch (error) {
@@ -437,5 +636,61 @@ router.get('/:userPublicKey/trends', async (req: Request, res: Response) => {
     res.status(500).json({ error: 'Failed to fetch credit score trends' });
   }
 });
+
+// POST /api/credit-score/issuer/sign-demo-attestation (Issuer / Admin role helper)
+router.post(
+  '/issuer/build-message',
+  authMiddleware,
+  requireRoles('issuer', 'admin'),
+  [
+    body('subjectPublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('issuerPublicKey').isString().isLength({ min: 56, max: 56 }),
+    body('kind').isInt({ min: 1, max: 2 }),
+    body('metricScore').isInt({ min: 0, max: 100 }),
+    body('amount').notEmpty(),
+    body('durationMonths').isInt({ min: 0, max: 120 }),
+    body('expiresInDays').optional().isInt({ min: 1, max: 3650 }),
+    body('financialData').isObject(),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const contracts = await stellarService.getContractAddresses();
+      if (!contracts.creditScore) {
+        return res.status(503).json({ error: 'CreditScore contract address is not configured' });
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const expiresAt = now + Number(req.body.expiresInDays || 180) * 86400;
+      const attestationIdHex = crypto.randomBytes(32).toString('hex');
+      const recordCommitmentHex = computeRecordCommitment(req.body.financialData);
+      const amountUnits = parseDecimalToStroops(req.body.amount);
+      const input: AttestationPayloadInput = {
+        attestationIdHex,
+        subjectPublicKey: req.body.subjectPublicKey,
+        kind: Number(req.body.kind),
+        recordCommitmentHex,
+        metricScore: Number(req.body.metricScore),
+        amountUnits,
+        durationMonths: Number(req.body.durationMonths),
+        issuedAt: now,
+        expiresAt,
+      };
+      const message = stellarService.buildAttestationSigningMessage(
+        contracts.creditScore,
+        req.body.issuerPublicKey,
+        input
+      );
+      res.json({
+        success: true,
+        attestationInput: input,
+        signingMessageHex: message.toString('hex'),
+      });
+    } catch (error) {
+      logger.error('Error building attestation signing payload:', error);
+      res.status(500).json({ error: 'Failed to build attestation payload' });
+    }
+  }
+);
 
 export { router as creditScoreRoutes };
