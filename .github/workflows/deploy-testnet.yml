@@ -1,0 +1,71 @@
+name: Deploy Hardened Contracts to Stellar Testnet
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_testnet:
+        description: 'Type TESTNET to confirm non-Mainnet Testnet deployment'
+        required: true
+        default: 'DRY-RUN'
+      use_ephemeral_keys:
+        description: 'Use ephemeral Friendbot-funded Testnet accounts when STELLAR_ADMIN_SECRET is unset'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-testnet:
+    name: Safe Gated Testnet Deployment & On-Chain Verification
+    runs-on: ubuntu-latest
+    environment: testnet
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate explicit Testnet confirmation
+        run: |
+          if [ "${{ inputs.confirm_testnet }}" != "TESTNET" ]; then
+            echo "Running dry-run only because confirm_testnet != TESTNET"
+          fi
+
+      - name: Install Rust toolchain & wasm32v1-none target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Build hardened Soroban WASMs
+        working-directory: contracts
+        run: cargo build --target wasm32v1-none --release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install backend Stellar SDK runtime
+        run: cd backend && npm ci --omit=dev
+
+      - name: Execute dry-run or gated Testnet deployment
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+          STELLAR_ADMIN_SECRET: ${{ secrets.STELLAR_ADMIN_SECRET }}
+        run: |
+          if [ "${{ inputs.confirm_testnet }}" = "TESTNET" ]; then
+            export CONFIRM_TESTNET_DEPLOY=1
+            if [ "${{ inputs.use_ephemeral_keys }}" = "true" ]; then
+              export ALLOW_EPHEMERAL_KEYS=1
+            fi
+            node scripts/testnet-deploy-and-verify.mjs --execute
+          else
+            node scripts/testnet-deploy-and-verify.mjs
+          fi
+
+      - name: Upload Testnet deployment manifest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-testnet-hardened-manifest
+          path: contracts/deployed-testnet-hardened.json

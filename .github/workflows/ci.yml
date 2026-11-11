@@ -1,67 +1,204 @@
-name: CI
+name: CreditLedger CI Pipeline
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   contracts:
-    name: Smart Contracts (Tests & WASM Build)
+    name: Soroban Smart Contracts
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: contracts
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust toolchain & targets
+        uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown, wasm32v1-none
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
         with:
-          workspaces: contracts
-      - name: Run Contract Tests
-        run: cargo test
-      - name: Build Release WASM Targets
-        run: cargo build --target wasm32-unknown-unknown --release
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy with strict warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run Soroban contract unit & security tests
+        run: cargo test --verbose
+
+      - name: Build release wasm32v1-none contracts & checksums
+        run: |
+          cargo build --target wasm32v1-none --release
+          sha256sum target/wasm32v1-none/release/*.wasm > target/wasm32v1-none/release/SHA256SUMS.txt
+          cat target/wasm32v1-none/release/SHA256SUMS.txt
+
+      - name: Upload contract WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-contracts-wasm
+          path: |
+            contracts/target/wasm32v1-none/release/*.wasm
+            contracts/target/wasm32v1-none/release/SHA256SUMS.txt
 
   backend:
-    name: Backend API (Build & Tests)
+    name: Backend API, Migrations & Security Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_postgres_password
+          POSTGRES_DB: credit_ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: backend
+    env:
+      NODE_ENV: test
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: ci_postgres_password
+      DB_NAME: credit_ledger
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-test-jwt-secret-key-minimum-32-characters-long
+      DATA_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
-      - name: Install Dependencies
+
+      - name: Install backend dependencies
         run: npm ci
-      - name: Compile TypeScript
+
+      - name: Verify reversible Knex migrations against live PostgreSQL
+        run: |
+          npx knex migrate:latest
+          npx knex migrate:rollback
+          npx knex migrate:latest
+
+      - name: TypeScript build
         run: npm run build
-      - name: Run Backend Tests
+
+      - name: Lint backend
+        run: npm run lint
+
+      - name: Run Jest unit & security test suites
         run: npm test -- --ci --forceExit
 
-  frontend:
-    name: Frontend App (Build & Tests)
+      - name: Audit backend production dependencies (fail on critical, log full report)
+        run: |
+          npm audit --omit=dev --audit-level=critical
+          npm audit --audit-level=high || true
+
+      - name: Upload compiled backend dist for E2E
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-dist
+          path: backend/dist
+
+  frontend-and-e2e:
+    name: Frontend Build, Vitest & Playwright E2E
     runs-on: ubuntu-latest
-    defaults:
-      run:
+    needs: [backend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend & backend runtime deps
+        run: |
+          cd backend && npm ci --omit=dev
+          cd ../frontend && npm ci
+
+      - name: Download compiled backend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+          path: backend/dist
+
+      - name: Build & Vitest check frontend
         working-directory: frontend
+        run: |
+          npm run lint
+          npm test -- --run
+          npm run build
+
+      - name: Audit frontend production dependencies (fail on critical, log full report)
+        working-directory: frontend
+        run: |
+          npm audit --omit=dev --audit-level=critical
+          npm audit --audit-level=high || true
+
+      - name: Install Playwright Chromium & run E2E suite
+        working-directory: frontend
+        run: |
+          npx playwright install --with-deps chromium
+          CI=1 npm run test:e2e
+
+  testnet-dry-run:
+    name: Verify Testnet Deployment Plan (Dry-Run)
+    runs-on: ubuntu-latest
+    needs: [contracts, backend]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-      - name: Install Dependencies
-        run: npm ci
-      - name: Run Vitest Suite
-        run: npm test -- --run
-      - name: Build Production Bundle
-        run: npm run build
+          cache-dependency-path: backend/package-lock.json
+      - name: Install Stellar SDK runtime in backend
+        run: cd backend && npm ci --omit=dev
+      - name: Download hardened contract WASMs
+        uses: actions/download-artifact@v4
+        with:
+          name: soroban-contracts-wasm
+          path: contracts/target/wasm32v1-none/release
+      - name: Run non-mutating Testnet deployment dry-run check
+        run: node scripts/testnet-deploy-and-verify.mjs

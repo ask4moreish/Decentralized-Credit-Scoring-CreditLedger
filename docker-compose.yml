@@ -1,100 +1,106 @@
-version: '3.8'
-
 services:
-  # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
-    container_name: credit-ledger-postgres
+    container_name: credit_ledger_postgres
     environment:
-      POSTGRES_DB: credit_ledger
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-creditledger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-credit_ledger}
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./backend/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./backend/database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     networks:
-      - credit-ledger-network
+      - credit_ledger_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-creditledger} -d ${POSTGRES_DB:-credit_ledger}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
-  # Redis Cache
   redis:
     image: redis:7-alpine
-    container_name: credit-ledger-redis
-    ports:
-      - "6379:6379"
+    container_name: credit_ledger_redis
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"]
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     networks:
-      - credit-ledger-network
+      - credit_ledger_internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
-  # Backend API
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: credit-ledger-backend
+    container_name: credit_ledger_backend
     environment:
-      NODE_ENV: development
+      NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_USER: postgres
-      DB_PASSWORD: postgres123
-      DB_NAME: credit_ledger
-      REDIS_URL: redis://redis:6379
-      STELLAR_NETWORK: testnet
-      STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
-      STELLAR_ADMIN_SECRET: ${STELLAR_ADMIN_SECRET}
-      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key}
-      FRONTEND_URL: http://localhost:3000
-    ports:
-      - "3001:3001"
+      DB_USER: ${POSTGRES_USER:-creditledger}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      DB_NAME: ${POSTGRES_DB:-credit_ledger}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (>= 32 chars)}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?DATA_ENCRYPTION_KEY must be set (64 hex chars)}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS must be set}
+      STELLAR_NETWORK: ${STELLAR_NETWORK:-testnet}
+      STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
+      CREDIT_SCORE_CONTRACT: ${CREDIT_SCORE_CONTRACT:-}
+      LOAN_MANAGER_CONTRACT: ${LOAN_MANAGER_CONTRACT:-}
+      COMMUNITY_VOUCH_CONTRACT: ${COMMUNITY_VOUCH_CONTRACT:-}
+      LOAN_TOKEN_CONTRACT: ${LOAN_TOKEN_CONTRACT:-}
+      COLLATERAL_TOKEN_CONTRACT: ${COLLATERAL_TOKEN_CONTRACT:-}
+      ADMIN_PUBLIC_KEYS: ${ADMIN_PUBLIC_KEYS:-}
+      ISSUER_PUBLIC_KEYS: ${ISSUER_PUBLIC_KEYS:-}
+      STELLAR_ADMIN_SECRET: ${STELLAR_ADMIN_SECRET:-}
+      RECONCILER_INTERVAL_MS: ${RECONCILER_INTERVAL_MS:-60000}
+    expose:
+      - "3001"
     depends_on:
-      - postgres
-      - redis
-    volumes:
-      - ./backend:/app
-      - /app/node_modules
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
-      - credit-ledger-network
+      - credit_ledger_internal
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
-  # Frontend Application
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: credit-ledger-frontend
-    environment:
-      VITE_API_URL: http://localhost:3001
-      VITE_STELLAR_NETWORK: testnet
-      VITE_STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+        VITE_STELLAR_NETWORK: ${STELLAR_NETWORK:-testnet}
+        VITE_CREDIT_SCORE_CONTRACT: ${CREDIT_SCORE_CONTRACT:-}
+        VITE_LOAN_MANAGER_CONTRACT: ${LOAN_MANAGER_CONTRACT:-}
+        VITE_COMMUNITY_VOUCH_CONTRACT: ${COMMUNITY_VOUCH_CONTRACT:-}
+    container_name: credit_ledger_frontend
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:80"
     depends_on:
-      - backend
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
+      backend:
+        condition: service_healthy
     networks:
-      - credit-ledger-network
-    restart: unless-stopped
-
-  # Stellar Quickstart (for local testing)
-  stellar:
-    image: stellar/quickstart:latest
-    container_name: credit-ledger-stellar
-    ports:
-      - "8000:8000"  # Horizon
-      - "8001:8001"  # Soroban RPC
-      - "8002:8002"  # Friendbot
-    environment:
-      - --local
-    networks:
-      - credit-ledger-network
+      - credit_ledger_internal
     restart: unless-stopped
 
 volumes:
@@ -102,5 +108,5 @@ volumes:
   redis_data:
 
 networks:
-  credit-ledger-network:
+  credit_ledger_internal:
     driver: bridge
