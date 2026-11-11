@@ -267,4 +267,35 @@ describe('CreditLedger Workflow UI Components', () => {
     expect(await screen.findByText(/Loan #1 \(pending\)/)).toBeTruthy();
     expect(screen.getByText(/Approve & Disburse/)).toBeTruthy();
   });
+
+  it('surfaces accessible error alert banner when collateral or Freighter tx preparation fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/loans/user/')) {
+        return { ok: true, text: async () => JSON.stringify({ data: { loans: [] } }) } as Response;
+      }
+      if (url.includes('/loans/prepare-apply')) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () =>
+            JSON.stringify({ error: 'Base tier score requires >= 125% collateral (500 XLM).' }),
+        } as Response;
+      }
+      return { ok: true, text: async () => '{}' } as Response;
+    });
+
+    render(
+      <MemoryRouter>
+        <LoansPage />
+      </MemoryRouter>
+    );
+
+    await screen.findByText(/Apply for a Loan/);
+    fireEvent.click(screen.getByRole('button', { name: /Prepare & Sign Loan Application/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/125% collateral/i);
+    expect(useWalletStore.getState().txState.stage).toBe('error');
+  });
 });

@@ -120,4 +120,99 @@ describe('Wallet Store (Freighter Auth, Signing & Refresh Rotation)', () => {
     expect(useWalletStore.getState().txState.stage).toBe('confirmed');
     expect(useWalletStore.getState().txState.txHash).toBe('hash_ok_1');
   });
+
+  it('transitions txState to error and skips /submit when Freighter declines transaction signature', async () => {
+    useWalletStore.setState({ isConnected: true, publicKey: pubKey, token: 'tok-1' });
+    vi.spyOn(freighter, 'getFreighterNetworkPassphrase').mockResolvedValue(
+      'Test SDF Network ; September 2015'
+    );
+    vi.spyOn(freighter, 'signSorobanXdr').mockRejectedValue(
+      new Error('Transaction signing cancelled by user in Freighter.')
+    );
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({ xdr: 'UNSIGNED_XDR_BLOB' }),
+    } as Response);
+
+    await expect(
+      useWalletStore.getState().executeSignedTx({
+        preparePath: '/loans/prepare-apply',
+        prepareBody: { borrowerPublicKey: pubKey, amount: '100', durationMonths: 6 },
+        submitPath: '/loans/submit',
+      })
+    ).rejects.toThrow(/cancelled by user/i);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // Only prepare called, submit skipped!
+    expect(useWalletStore.getState().txState.stage).toBe('error');
+    expect(useWalletStore.getState().txState.message).toMatch(/cancelled by user/i);
+  });
+
+  it('rotates tokens on 401 expiry and clears session when refresh also fails', async () => {
+    const { apiRequest } = await import('../services/api');
+    useWalletStore.setState({
+      isConnected: true,
+      publicKey: pubKey,
+      token: 'expired-jwt',
+      refreshToken: 'refresh-valid-1',
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/auth/refresh')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ token: 'fresh-jwt-2', refreshToken: 'refresh-2' }),
+          text: async () => JSON.stringify({ token: 'fresh-jwt-2', refreshToken: 'refresh-2' }),
+        } as Response;
+      }
+      if (fetchSpy.mock.calls.length === 1) {
+        return {
+          ok: false,
+          status: 401,
+          text: async () => JSON.stringify({ error: 'Token expired' }),
+        } as Response;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) } as Response;
+    });
+
+    const okRes = await apiRequest('/loans/pool');
+    expect(okRes.ok).toBe(true);
+    expect(useWalletStore.getState().token).toBe('fresh-jwt-2');
+    expect(useWalletStore.getState().refreshToken).toBe('refresh-2');
+
+    // Now simulate expired/revoked refresh token -> session cleared completely
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 401,
+      text: async () => JSON.stringify({ error: 'Refresh expired' }),
+    } as Response);
+
+    await expect(apiRequest('/loans/pool')).rejects.toThrow();
+    expect(useWalletStore.getState().isConnected).toBe(false);
+    expect(useWalletStore.getState().token).toBeNull();
+  });
+
+  it('disconnect posts /auth/logout and clears active wallet state', async () => {
+    useWalletStore.setState({
+      isConnected: true,
+      publicKey: pubKey,
+      token: 'tok-live',
+      refreshToken: 'ref-live',
+      isAdmin: true,
+      roles: ['admin', 'borrower'],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({ success: true }),
+    } as Response);
+
+    await useWalletStore.getState().disconnect();
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(useWalletStore.getState().isConnected).toBe(false);
+    expect(useWalletStore.getState().publicKey).toBeNull();
+    expect(useWalletStore.getState().isAdmin).toBe(false);
+    expect(useWalletStore.getState().txState.stage).toBe('idle');
+  });
 });

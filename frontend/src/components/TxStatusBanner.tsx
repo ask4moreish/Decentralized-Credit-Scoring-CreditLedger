@@ -18,6 +18,7 @@ export function TxStatusBanner() {
     <div
       data-testid="tx-status-banner"
       data-stage={txState.stage}
+      role={txState.stage === 'error' ? 'alert' : 'status'}
       className={`mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3 text-sm ${styles[txState.stage] || 'border-slate-200 bg-slate-50'}`}
     >
       <div>
