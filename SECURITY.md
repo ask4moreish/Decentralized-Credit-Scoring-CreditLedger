@@ -1,50 +1,41 @@
-# Security Policy — CreditLedger
+# Security Policy & Threat Model
 
-## Supported Versions
+## 1. Reporting Vulnerabilities
 
-Only the latest release on the `main` branch is actively supported with security updates.
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
-| < 1.0.0 | :x:                |
+If you discover a security vulnerability in CreditLedger, do **not** open a public issue with exploit details before triage. Report findings privately via GitHub Security Advisories or direct maintainer security contact.
 
 ---
 
-## Security Architecture & Threat Model
+## 2. Implemented Security Controls
 
-CreditLedger implements a decentralized, non-custodial credit scoring and lending architecture built on the Stellar network with Soroban smart contracts:
+### Smart Contracts (`contracts/`)
+- **Authenticated Single Initialization & Two-Step Admin Transfer**: `initialize(...)` requires `admin.require_auth()` and rejects re-initialization (`AlreadyInitialized`). Ownership rotation requires `propose_admin` (current admin) followed by explicit `accept_admin` (pending admin).
+- **Pause Emergency Circuit Breaker**: `pause` / `unpause` halts value-transferring or state-mutating paths across `CreditScore`, `LoanManager`, and `CommunityVouch`.
+- **Cryptographic Attestation Integrity**: Authoritative credit score inputs require either an authorized issuer address (`require_auth()`) or an on-chain verified Ed25519 signature (`env.crypto().ed25519_verify`) bound to contract address, subject, `attestation_id`, and `record_commitment`.
+- **Self-Report Isolation**: `submit_self_reported_record` carries **0%** scoring weight and cannot bypass verification.
+- **Issuer Compromise Recovery**: `revoke_issuer` invalidates attestations from compromised issuers (`revoked_for_cause = true`); dual-signed `rotate_issuer_key` replaces compromised keys while preserving valid historical attestations.
+- **Escrow & Lending Custody Invariants**:
+  - `LoanManager` executes real SEP-41 token transfers, tracks committed cash vs uncommitted `available_cash`, amortizes interest/fees prior to principal, and enforces bounded liquidation (`+5%` buffer) with surplus collateral refunds.
+  - `CommunityVouch` enforces real SEP-41 token escrow, derives trust weight strictly on-chain, prevents duplicate active pairs, applies Checks-Effects-Interactions (`escrowed_balance = 0`, `withdrawn = true`) before external transfers, and caps borrower-default slashing at `50%` (`MAX_SLASH_BPS = 5_000`).
 
-1. **Non-Custodial Authorization**:
-   - User actions (applying for loans, repaying loans, issuing community vouches, revoking vouches, updating alternative financial data) are signed directly by the user's Stellar wallet (e.g., Freighter) using their private key.
-   - The backend service does not hold, access, or escrow user private keys.
-   - Administrative keys (`STELLAR_ADMIN_SECRET`) are strictly constrained to administrative operations (`approve_loan`, `mark_default`) and are never used to impersonate borrowers.
+### Backend & Privacy (`backend/`)
+- **Challenge Replay Resistance**: Single-use 256-bit challenges stored in Redis and consumed atomically via `GETDEL` / Lua script (`consumeChallengeNonce`). Fails closed (`503`) in production if Redis is offline.
+- **Freighter Wallet Signatures (Raw & SEP-0053)**: Verifies Ed25519 signatures over raw challenge bytes and Stellar SEP-0053 prefixed SHA-256 digests without any bypass fallback.
+- **Session Rotation & Revocation**: 15-minute `HS256` JWTs (`issuer: 'creditledger-api'`) with JTI revocation on logout/rotation plus single-use rotating refresh tokens with reuse-attack family revocation (`revokeSessionFamily`).
+- **Role-Based Access Control & IDOR Prevention**: Privileged routes enforce `requireAdmin` or `requireRoles('issuer', 'admin')` from server-side `ADMIN_PUBLIC_KEYS` / `ISSUER_PUBLIC_KEYS` allowlists; user routes enforce owner-or-admin checks (`403`).
+- **Fail-Closed Secret Validation**: Production startup throws if `JWT_SECRET`, `DATA_ENCRYPTION_KEY`, or a non-default `DB_PASSWORD` is missing.
+- **At-Rest Privacy & Selective Disclosure**: Off-chain financial payloads are encrypted via `AES-256-GCM`, stripped of forbidden PII keys (`ssn`, `iban`, `accountNumber`, `phoneNumber`, `email`, `fullName`, `address`) during selective disclosure, erasable via `DELETE /api/credit-score/:key/privacy`, and scrubbed from logs (`redactSensitiveForLogs`).
+- **Idempotency & Reconciliation**: Mutating preparation/submission endpoints honor `Idempotency-Key` with SHA-256 payload conflict detection (`409`); `reconcilePendingTransactions` synchronizes PostgreSQL `stellar_transactions` against Soroban RPC.
 
-2. **Replay & Impersonation Protection**:
-   - Authentication challenges are cryptographically generated, tracked with single-use nonce consumption, and expired after a 5-minute time-to-live (TTL).
-   - Signatures are verified directly against Ed25519 public keys using the Stellar SDK.
-   - JWT sessions are signed with a high-entropy secret, scoped to the verified public key, and set to expire within 24 hours.
-
-3. **Smart Contract Invariants**:
-   - Scores operate strictly on a deterministic **0–100 scale**.
-   - Loan eligibility enforces a minimum credit score of 50. Borrowers with scores below 60 require collateral.
-   - Duplicate repayments, excess repayments beyond the outstanding balance, and repayments against non-active loans are rejected with explicit contract errors.
-   - Vouch revocations dynamically trigger score recalculations in the credit scoring contract.
-
-4. **Privacy & Data Minimization**:
-   - Raw payment histories and savings records are submitted directly by users or verified through cryptographic state proofs.
-   - Sensitive session data, internal database identifiers, and unhashed credentials are never logged to stdout or files.
+### Frontend & Infrastructure
+- **Strictly Non-Custodial Wallet Signing**: Unsigned XDRs are built via `rpc.prepareTransaction` and signed only client-side in Freighter (`signTransaction`).
+- **Strict Secret Hygiene & Headers**: `.env` files are excluded via `.gitignore`; `docker-compose.yml` requires explicit environment variables without default weak credentials; `frontend/nginx.conf` enforces strict `Content-Security-Policy` (no `http:` connect sources), `X-Frame-Options: DENY`, and `frame-ancestors 'none'`.
 
 ---
 
-## Reporting a Vulnerability
+## 3. Production Security Boundaries & Preconditions
 
-If you discover a potential security vulnerability within CreditLedger, please report it responsibly:
-
-1. **Do not** create public GitHub issues or discussions for unpatched security vulnerabilities.
-2. Email the maintainers at `security@creditledger.io` (or reach out via GitHub Security Advisories if enabled).
-3. Include the following details:
-   - Affected component (Smart Contract, Backend API, Frontend UI, Database Migration).
-   - Step-by-step reproduction instructions or proof-of-concept.
-   - Assessment of potential exploitability and financial/data impact.
-4. The security team will acknowledge receipt within 48 hours and provide a remediation timeline.
+CreditLedger has completed automated unit, integration, browser E2E, and Stellar Testnet contract verification, **not** an independent third-party smart contract audit. Before any Stellar Mainnet deployment:
+1. Obtain a formal third-party audit of all three Soroban Rust crates.
+2. Replace any hot backend `STELLAR_ADMIN_SECRET` with multisig / HSM / KMS governance custody.
+3. Enforce TLS termination at ingress/load balancer and configure automated encrypted PostgreSQL PITR backups.
