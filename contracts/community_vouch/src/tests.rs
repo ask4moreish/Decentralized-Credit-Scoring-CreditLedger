@@ -1,193 +1,358 @@
 #![cfg(test)]
 
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env, String};
+use soroban_sdk::{
+    contract, contractimpl,
+    testutils::{storage::Persistent as _, Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, Env, IntoVal, String, Symbol,
+};
 
-use crate::{CommunityVouchContract, CommunityVouchContractClient};
-
-// ── Mock CreditScore that accepts add_community_vouch and remove_community_vouch ──
+use crate::{CommunityVouchContract, CommunityVouchContractClient, CreditScoreData, VouchError};
 
 #[contract]
 pub struct MockCreditScore;
 
 #[contractimpl]
 impl MockCreditScore {
-    pub fn add_community_vouch(
-        _env: Env,
-        _user: Address,
-        _voucher: Address,
-        _amount: u128,
-        _trust_score: u32,
-    ) {
-        // no-op
+    pub fn set_score(env: Env, user: Address, score: u32) {
+        env.storage()
+            .instance()
+            .set(&(Symbol::new(&env, "s"), user), &score);
     }
 
-    pub fn remove_community_vouch(
-        _env: Env,
-        _user: Address,
+    pub fn set_should_fail(env: Env, fail: bool) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "fail"), &fail);
+    }
+
+    pub fn get_credit_score(env: Env, user: Address) -> CreditScoreData {
+        let score: u32 = env
+            .storage()
+            .instance()
+            .get(&(Symbol::new(&env, "s"), user))
+            .unwrap_or(0);
+        CreditScoreData {
+            score,
+            last_updated: 0,
+            payment_history_score: score,
+            savings_score: score,
+            community_score: 0,
+            activity_score: score,
+        }
+    }
+
+    pub fn add_community_vouch(
+        env: Env,
+        vouch_id: u64,
+        user: Address,
         _voucher: Address,
+        escrowed_amount: u128,
+        trust_score: u32,
+        _expires_at: u64,
     ) {
-        // no-op
+        let should_fail: bool = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "fail"))
+            .unwrap_or(false);
+        if should_fail {
+            panic!("Simulated cross-contract failure");
+        }
+        env.storage().instance().set(
+            &(Symbol::new(&env, "v"), user, vouch_id),
+            &(escrowed_amount, trust_score),
+        );
+    }
+
+    pub fn remove_community_vouch(env: Env, user: Address, vouch_id: u64) {
+        env.storage()
+            .instance()
+            .remove(&(Symbol::new(&env, "v"), user, vouch_id));
+    }
+
+    pub fn get_synced_vouch(env: Env, user: Address, vouch_id: u64) -> Option<(u128, u32)> {
+        env.storage()
+            .instance()
+            .get(&(Symbol::new(&env, "v"), user, vouch_id))
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+struct TestCtx<'a> {
+    env: Env,
+    cs_id: Address,
+    client: CommunityVouchContractClient<'a>,
+    token: TokenClient<'a>,
+    sac: StellarAssetClient<'a>,
+}
 
-fn setup() -> (Env, Address, CommunityVouchContractClient<'static>) {
+fn setup() -> TestCtx<'static> {
     let env = Env::default();
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_750_000_000;
+        li.sequence_number = 10_000;
+    });
     env.mock_all_auths();
 
-    let mock_cs_id = env.register(MockCreditScore, ());
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let sac_contract = env.register_stellar_asset_contract_v2(token_admin);
+    let token_id = sac_contract.address();
+    let token = TokenClient::new(&env, &token_id);
+    let sac = StellarAssetClient::new(&env, &token_id);
+
+    let cs_id = env.register(MockCreditScore, ());
     let contract_id = env.register(CommunityVouchContract, ());
     let client = CommunityVouchContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &cs_id, &token_id);
+
+    TestCtx {
+        env,
+        cs_id,
+        client,
+        token,
+        sac,
+    }
+}
+
+#[test]
+fn test_initialize_requires_admin_auth_and_rejects_reinit() {
+    let env = Env::default();
     let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let cs_id = env.register(MockCreditScore, ());
+    let tok = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract_id = env.register(CommunityVouchContract, ());
+    let client = CommunityVouchContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &mock_cs_id);
-    (env, admin, client)
+    assert!(client.try_initialize(&admin, &cs_id, &tok).is_err());
+
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&admin, &cs_id, &tok).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&admin, &cs_id, &tok);
+    assert_eq!(client.get_admin(), admin);
+
+    env.mock_all_auths();
+    assert_eq!(
+        client.try_initialize(&attacker, &cs_id, &tok),
+        Err(Ok(VouchError::AlreadyInitialized))
+    );
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[test]
-#[should_panic(expected = "Contract already initialized")]
-fn test_double_initialize_panics() {
-    let (env, admin, client) = setup();
-    let cs = Address::generate(&env);
-    client.initialize(&admin, &cs);
-}
+fn test_real_escrow_policy_weight_and_anti_double_withdraw() {
+    let ctx = setup();
+    let voucher = Address::generate(&ctx.env);
+    let vouchee = Address::generate(&ctx.env);
+    let stranger = Address::generate(&ctx.env);
 
-#[test]
-fn test_create_vouch_returns_id() {
-    let (env, _admin, client) = setup();
-    let voucher = Address::generate(&env);
-    let vouchee = Address::generate(&env);
+    // Voucher starts with 1_500_000 tokens and score 80
+    ctx.sac.mint(&voucher, &1_500_000i128);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&voucher, &80u32);
 
-    // New voucher has no trust network → vouching_capacity defaults to 1_000_000
-    // and min_trust_score = max(0 - 20, 20) = 20; trust_score 50 ≥ 20 ✓
-    let vouch_id = client.create_vouch(
+    let vouch_id = ctx.client.create_vouch(
         &voucher,
         &vouchee,
-        &500_000u128,
-        &50u32,
-        &String::from_str(&env, "Good community member"),
+        &1_000_000u128,
+        &String::from_str(&ctx.env, "Verified cooperative peer"),
         &6u32,
     );
-    assert_eq!(vouch_id, 1);
-}
 
-#[test]
-fn test_get_vouch_after_create() {
-    let (env, _admin, client) = setup();
-    let voucher = Address::generate(&env);
-    let vouchee = Address::generate(&env);
+    // Real escrow locked inside contract
+    assert_eq!(ctx.token.balance(&voucher), 500_000);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 1_000_000);
+    assert_eq!(ctx.client.get_total_escrowed(), 1_000_000);
 
-    let vouch_id = client.create_vouch(
-        &voucher,
-        &vouchee,
-        &100_000u128,
-        &50u32,
-        &String::from_str(&env, "Trusted"),
-        &3u32,
+    // Trust weight computed strictly by policy: (80 * 70 / 100) + 30 = 86
+    let vouch = ctx.client.get_vouch(&vouch_id);
+    assert_eq!(vouch.trust_score, 86);
+    assert_eq!(vouch.escrowed_balance, 1_000_000);
+
+    // Cross-contract sync recorded
+    let cs = MockCreditScoreClient::new(&ctx.env, &ctx.cs_id);
+    assert_eq!(
+        cs.get_synced_vouch(&vouchee, &vouch_id),
+        Some((1_000_000u128, 86u32))
     );
 
-    let vouch = client.get_vouch(&vouch_id);
-    assert_eq!(vouch.voucher, voucher);
-    assert_eq!(vouch.vouchee, vouchee);
-    assert_eq!(vouch.amount, 100_000u128);
-    assert!(vouch.is_active);
-}
-
-#[test]
-fn test_revoke_vouch() {
-    let (env, _admin, client) = setup();
-    let voucher = Address::generate(&env);
-    let vouchee = Address::generate(&env);
-
-    let vouch_id = client.create_vouch(
-        &voucher,
-        &vouchee,
-        &100_000u128,
-        &50u32,
-        &String::from_str(&env, "Trusted"),
-        &3u32,
+    // Duplicate active pair rejected
+    assert_eq!(
+        ctx.client.try_create_vouch(
+            &voucher,
+            &vouchee,
+            &50_000u128,
+            &String::from_str(&ctx.env, "Second"),
+            &3u32,
+        ),
+        Err(Ok(VouchError::DuplicateActiveVouch))
     );
 
-    client.revoke_vouch(&voucher, &vouch_id);
-    let vouch = client.get_vouch(&vouch_id);
-    assert!(!vouch.is_active);
+    // Unauthorized revocation rejected
+    assert_eq!(
+        ctx.client.try_revoke_vouch(&stranger, &vouch_id),
+        Err(Ok(VouchError::Unauthorized))
+    );
+
+    // Revoking returns real escrowed funds cleanly & prevents double withdrawal
+    let refunded = ctx.client.revoke_vouch(&voucher, &vouch_id);
+    assert_eq!(refunded, 1_000_000);
+    assert_eq!(ctx.token.balance(&voucher), 1_500_000);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+    assert_eq!(ctx.client.get_total_escrowed(), 0);
+    assert_eq!(cs.get_synced_vouch(&vouchee, &vouch_id), None);
+
+    assert_eq!(
+        ctx.client.try_revoke_vouch(&voucher, &vouch_id),
+        Err(Ok(VouchError::VouchAlreadyWithdrawn))
+    );
+    assert_eq!(
+        ctx.client
+            .try_withdraw_remaining_escrow(&voucher, &vouch_id),
+        Err(Ok(VouchError::VouchAlreadyWithdrawn))
+    );
 }
 
 #[test]
-#[should_panic(expected = "Cannot vouch for yourself")]
-fn test_cannot_vouch_for_self() {
-    let (env, _admin, client) = setup();
-    let user = Address::generate(&env);
-    client.create_vouch(
-        &user,
-        &user,
+fn test_trust_decay_cooldown_expiry_and_bounded_default_slashing() {
+    let ctx = setup();
+    let voucher = Address::generate(&ctx.env);
+    let vouchee = Address::generate(&ctx.env);
+    let loan_manager = Address::generate(&ctx.env);
+    let pool = Address::generate(&ctx.env);
+
+    ctx.client.set_loan_manager_contract(&loan_manager, &pool);
+    ctx.client.set_revocation_cooldown(&(7 * 86_400));
+
+    ctx.sac.mint(&voucher, &2_000_000i128);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&voucher, &60u32);
+
+    let vid = ctx.client.create_vouch(
+        &voucher,
+        &vouchee,
+        &1_000_000u128,
+        &String::from_str(&ctx.env, "Trade guild guarantee"),
+        &2u32, // 60 days = 5_184_000s
+    );
+    // Trust = (60*70/100) + 30 = 42 + 30 = 72
+    assert_eq!(ctx.client.get_effective_vouch_trust(&vid), 72);
+
+    // Cooldown prevents premature revocation
+    assert_eq!(
+        ctx.client.try_revoke_vouch(&voucher, &vid),
+        Err(Ok(VouchError::CooldownActive))
+    );
+
+    // Advance to 75% of vouch duration -> trust decays between 72 and 36 (approx 54)
+    let start = ctx.client.get_vouch(&vid).created_at;
+    let end = ctx.client.get_vouch(&vid).expiration_date;
+    ctx.env.ledger().with_mut(|li| {
+        li.timestamp = start + ((end - start) * 3) / 4;
+    });
+    let decayed = ctx.client.get_effective_vouch_trust(&vid);
+    assert!((36..72).contains(&decayed));
+
+    // Unauthorized caller cannot trigger slashing
+    ctx.env.mock_auths(&[MockAuth {
+        address: &voucher,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.client.address,
+            fn_name: "slash_vouches_on_default",
+            args: (&vouchee, &500_000u128).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx
+        .client
+        .try_slash_vouches_on_default(&vouchee, &500_000u128)
+        .is_err());
+
+    // LoanManager triggers default slash -> bounded strictly at 50% (500_000 out of 1_000_000)
+    ctx.env.mock_all_auths();
+    let slashed = ctx.client.slash_vouches_on_default(&vouchee, &900_000u128);
+    assert_eq!(slashed, 500_000);
+    assert_eq!(ctx.token.balance(&pool), 500_000);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 500_000);
+
+    // Voucher safely reclaims unslashed 50% remainder once without double withdrawal
+    let reclaimed = ctx.client.withdraw_remaining_escrow(&voucher, &vid);
+    assert_eq!(reclaimed, 500_000);
+    assert_eq!(ctx.token.balance(&voucher), 1_500_000);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn test_vouch_expiry_pagination_and_ttl_extension() {
+    let ctx = setup();
+    let voucher = Address::generate(&ctx.env);
+    let vouchee1 = Address::generate(&ctx.env);
+    let vouchee2 = Address::generate(&ctx.env);
+    let vouchee3 = Address::generate(&ctx.env);
+
+    ctx.sac.mint(&voucher, &500_000i128);
+    MockCreditScoreClient::new(&ctx.env, &ctx.cs_id).set_score(&voucher, &80u32);
+
+    let v1 = ctx.client.create_vouch(
+        &voucher,
+        &vouchee1,
         &100_000u128,
-        &50u32,
-        &String::from_str(&env, "Self"),
+        &String::from_str(&ctx.env, "Peer 1"),
         &1u32,
     );
-}
+    let _v2 = ctx.client.create_vouch(
+        &voucher,
+        &vouchee2,
+        &100_000u128,
+        &String::from_str(&ctx.env, "Peer 2"),
+        &2u32,
+    );
+    let _v3 = ctx.client.create_vouch(
+        &voucher,
+        &vouchee3,
+        &100_000u128,
+        &String::from_str(&ctx.env, "Peer 3"),
+        &3u32,
+    );
 
-#[test]
-fn test_get_user_vouches() {
-    let (env, _admin, client) = setup();
-    let voucher1 = Address::generate(&env);
-    let voucher2 = Address::generate(&env);
-    let vouchee1 = Address::generate(&env);
-    let vouchee2 = Address::generate(&env);
+    let p1 = ctx.client.get_user_vouches_page(&voucher, &0, &2);
+    let p2 = ctx.client.get_user_vouches_page(&voucher, &2, &2);
+    assert_eq!(p1.len(), 2);
+    assert_eq!(p2.len(), 1);
+    assert!(ctx.client.is_trusted_connection(&vouchee1, &voucher, &1));
 
-    client.create_vouch(&voucher1, &vouchee1, &100_000u128, &50u32, &String::from_str(&env, "A"), &3u32);
-    client.create_vouch(&voucher2, &vouchee2, &100_000u128, &50u32, &String::from_str(&env, "B"), &3u32);
+    // Expire v1 only after expiration date passes
+    assert_eq!(
+        ctx.client.try_expire_vouch(&voucher, &v1),
+        Err(Ok(VouchError::VouchNotExpired))
+    );
+    let exp = ctx.client.get_vouch(&v1).expiration_date;
+    ctx.env.ledger().with_mut(|li| {
+        li.timestamp = exp;
+        li.sequence_number += 1_000;
+    });
+    let refunded = ctx.client.expire_vouch(&vouchee1, &v1);
+    assert_eq!(refunded, 100_000);
+    assert_eq!(ctx.token.balance(&voucher), 300_000);
 
-    let vouches1 = client.get_user_vouches(&voucher1);
-    assert_eq!(vouches1.len(), 1);
-    let vouches2 = client.get_user_vouches(&voucher2);
-    assert_eq!(vouches2.len(), 1);
-}
-
-#[test]
-fn test_get_user_received_vouches() {
-    let (env, _admin, client) = setup();
-    let voucher = Address::generate(&env);
-    let vouchee = Address::generate(&env);
-
-    client.create_vouch(&voucher, &vouchee, &100_000u128, &50u32, &String::from_str(&env, "A"), &3u32);
-
-    let received = client.get_user_received_vouches(&vouchee);
-    assert_eq!(received.len(), 1);
-}
-
-#[test]
-fn test_vouch_statistics() {
-    let (env, _admin, client) = setup();
-    let voucher = Address::generate(&env);
-    let vouchee = Address::generate(&env);
-
-    client.create_vouch(&voucher, &vouchee, &100_000u128, &50u32, &String::from_str(&env, "A"), &3u32);
-
-    let stats = client.get_vouch_statistics(&voucher);
-    assert_eq!(stats.total_vouches_given, 1);
-    assert_eq!(stats.active_vouches_given, 1);
-
-    let stats_vouchee = client.get_vouch_statistics(&vouchee);
-    assert_eq!(stats_vouchee.total_vouches_received, 1);
-    assert_eq!(stats_vouchee.active_vouches_received, 1);
-}
-
-#[test]
-fn test_is_trusted_connection() {
-    let (env, _admin, client) = setup();
-    let voucher = Address::generate(&env);
-    let vouchee = Address::generate(&env);
-    let stranger = Address::generate(&env);
-
-    client.create_vouch(&voucher, &vouchee, &100_000u128, &50u32, &String::from_str(&env, "A"), &3u32);
-
-    // vouchee should see voucher as a direct connection
-    assert!(client.is_trusted_connection(&vouchee, &voucher, &1u32));
-    // stranger is not connected
-    assert!(!client.is_trusted_connection(&vouchee, &stranger, &2u32));
+    // Advance ledger sequence far into the future to test persistent/instance TTL maintenance
+    ctx.env.ledger().with_mut(|li| {
+        li.sequence_number += 2_100_000;
+    });
+    ctx.client.extend_vouch_ttl(&_v2);
+    ctx.env.as_contract(&ctx.client.address, || {
+        let ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::VouchDataKey::Vouch(_v2));
+        assert!(ttl >= 2_500_000);
+    });
 }
