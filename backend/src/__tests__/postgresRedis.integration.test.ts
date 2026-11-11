@@ -103,7 +103,7 @@ describeWithInfra('Live PostgreSQL & Redis Integration Verification', () => {
     const access1 = loginRes.body.token;
     const refresh1 = loginRes.body.refreshToken;
 
-    const sessionRows = await db('user_sessions').where({ user_public_key: userKp.publicKey() });
+    const sessionRows = await db('user_sessions').where({ public_key: userKp.publicKey() });
     expect(sessionRows.length).toBeGreaterThanOrEqual(1);
 
     const refRes = await request(app)
@@ -166,7 +166,7 @@ describeWithInfra('Live PostgreSQL & Redis Integration Verification', () => {
     expect(prep.status).toBe(200);
 
     const pgEncRows = await db('encrypted_financial_records').where({
-      user_public_key: userKp.publicKey(),
+      owner_public_key: userKp.publicKey(),
     });
     expect(pgEncRows.length).toBeGreaterThanOrEqual(1);
     expect(pgEncRows[0].ciphertext).not.toContain('PG-PRIV-001');
@@ -194,10 +194,16 @@ describeWithInfra('Live PostgreSQL & Redis Integration Verification', () => {
     expect(eraseRes.status).toBe(200);
     expect(eraseRes.body.deletedRecords).toBeGreaterThanOrEqual(1);
 
-    const afterEraseRows = await db('encrypted_financial_records').where({
-      user_public_key: userKp.publicKey(),
-    });
+    const afterEraseRows = await db('encrypted_financial_records')
+      .where({ owner_public_key: userKp.publicKey() })
+      .whereNull('deleted_at');
     expect(afterEraseRows).toHaveLength(0);
+    const scrubbedRows = await db('encrypted_financial_records').where({
+      owner_public_key: userKp.publicKey(),
+    });
+    expect(scrubbedRows.length).toBeGreaterThanOrEqual(1);
+    expect(scrubbedRows[0].ciphertext).toBe('DELETED');
+    expect(scrubbedRows[0].deleted_at).not.toBeNull();
 
     const auditRows = await db('audit_logs').where({
       actor_public_key: userKp.publicKey(),
@@ -216,7 +222,7 @@ describeWithInfra('Live PostgreSQL & Redis Integration Verification', () => {
       activityScore: 60,
       modelVersion: 2,
     });
-    const snaps = await db('score_snapshots').where({ user_public_key: userKp.publicKey() });
+    const snaps = await db('score_snapshots').where({ public_key: userKp.publicKey() });
     expect(snaps.length).toBeGreaterThanOrEqual(1);
   });
 
