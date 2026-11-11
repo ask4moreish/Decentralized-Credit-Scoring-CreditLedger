@@ -1,212 +1,294 @@
 import { create } from 'zustand';
-import { devtools, persist } from 'zustand/middleware';
-import { ALLOWED_NETWORK, NETWORK_PASSPHRASE, API_URL } from '../config/stellar';
-import * as freighter from '@stellar/freighter-api';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import { STELLAR_CONFIG } from '../config/stellar';
+import { apiRequest, registerAuthTokensProvider } from '../services/api';
+import {
+  checkFreighterConnected,
+  getFreighterNetworkPassphrase,
+  requestFreighterAccess,
+  signAuthChallenge,
+  signSorobanXdr,
+} from '../services/freighter';
+
+export type UserRole = 'borrower' | 'lender' | 'issuer' | 'admin';
+
+export interface TxLifecycleState {
+  stage: 'idle' | 'preparing' | 'awaiting_signature' | 'submitting' | 'confirmed' | 'error';
+  message?: string;
+  txHash?: string;
+  ledger?: number | null;
+}
 
 interface WalletState {
   isConnected: boolean;
-  isConnecting: boolean;
   publicKey: string | null;
-  network: string;
-  authToken: string | null;
+  token: string | null;
+  refreshToken: string | null;
+  role: UserRole;
+  roles: UserRole[];
   isAdmin: boolean;
+  network: 'testnet' | 'mainnet';
+  balance: string | null;
+  isLoading: boolean;
   error: string | null;
+  txState: TxLifecycleState;
 
-  // Actions
-  connect: () => Promise<void>;
-  disconnect: () => void;
-  setError: (error: string | null) => void;
-  setConnecting: (isConnecting: boolean) => void;
-  getAuthToken: () => string | null;
-  signTransaction: (xdr: string) => Promise<string>;
+  connect: (preferredRole?: 'borrower' | 'lender') => Promise<void>;
+  disconnect: () => Promise<void>;
+  refreshAccountBalance: () => Promise<void>;
+  clearError: () => void;
+  clearTxState: () => void;
+  executeSignedTx: <T = any>(params: {
+    preparePath: string;
+    prepareBody: Record<string, unknown>;
+    submitPath: string;
+    submitBody?: Record<string, unknown>;
+  }) => Promise<T>;
 }
 
+const INITIAL_TX: TxLifecycleState = { stage: 'idle' };
+
 export const useWalletStore = create<WalletState>()(
-  devtools(
-    persist(
-      (set, get) => ({
-        isConnected: false,
-        isConnecting: false,
-        publicKey: null,
-        network: ALLOWED_NETWORK,
-        authToken: typeof localStorage !== 'undefined' ? localStorage.getItem('auth_token') : null,
-        isAdmin: false,
-        error: null,
+  persist(
+    (set, get) => ({
+      isConnected: false,
+      publicKey: null,
+      token: null,
+      refreshToken: null,
+      role: 'borrower',
+      roles: ['borrower'],
+      isAdmin: false,
+      network: STELLAR_CONFIG.network,
+      balance: null,
+      isLoading: false,
+      error: null,
+      txState: INITIAL_TX,
 
-        connect: async () => {
-          const { setError, setConnecting } = get();
-
-          try {
-            setConnecting(true);
-            setError(null);
-
-            // Check if Freighter is available in window or via freighter-api
-            const hasWindowFreighter = typeof window !== 'undefined' && Boolean((window as any).freighter);
-            let isFreighterConnected = false;
-
-            if (hasWindowFreighter) {
-              isFreighterConnected = true;
-            } else {
-              try {
-                const conn = await freighter.isConnected();
-                isFreighterConnected = typeof conn === 'boolean' ? conn : Boolean(conn?.isConnected);
-              } catch {
-                isFreighterConnected = false;
-              }
-            }
-
-            if (!isFreighterConnected && !hasWindowFreighter) {
-              throw new Error('Freighter wallet not detected. Please install Freighter extension.');
-            }
-
-            // Verify network
-            let currentNetwork = '';
-            if (hasWindowFreighter && typeof (window as any).freighter.getNetwork === 'function') {
-              const winNet = await (window as any).freighter.getNetwork();
-              currentNetwork = typeof winNet === 'string' ? winNet : winNet?.network || '';
-            } else {
-              try {
-                const netObj = await freighter.getNetwork();
-                currentNetwork = typeof netObj === 'string' ? netObj : (netObj as any)?.network || '';
-              } catch {
-                currentNetwork = ALLOWED_NETWORK;
-              }
-            }
-
-            if (currentNetwork && currentNetwork.toLowerCase() !== ALLOWED_NETWORK.toLowerCase()) {
-              throw new Error(`Please switch to ${ALLOWED_NETWORK} network in Freighter.`);
-            }
-
-            // Get public key
-            let userPublicKey = '';
-            if (hasWindowFreighter && typeof (window as any).freighter.getPublicKey === 'function') {
-              userPublicKey = await (window as any).freighter.getPublicKey();
-            } else {
-              try {
-                const addrResult = await freighter.getAddress();
-                userPublicKey = typeof addrResult === 'string' ? addrResult : (addrResult as any)?.address || '';
-              } catch {
-                userPublicKey = '';
-              }
-            }
-
-            if (!userPublicKey) {
-              throw new Error('Failed to get public key from wallet.');
-            }
-
-            // Authenticate with backend and obtain JWT session
-            let token: string | null = null;
-            let isAdminUser = false;
-
-            try {
-              const challengeRes = await fetch(`${API_URL}/api/auth/challenge`);
-              if (challengeRes.ok) {
-                const { challenge } = await challengeRes.json();
-                let signatureHex = '';
-
-                if (typeof freighter.signMessage === 'function') {
-                  const signed = await freighter.signMessage(challenge);
-                  signatureHex = typeof signed === 'string' ? signed : Buffer.from((signed as any).signature).toString('hex');
-                } else {
-                  signatureHex = Buffer.from(challenge).toString('hex');
-                }
-
-                const loginRes = await fetch(`${API_URL}/api/auth/login`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    publicKey: userPublicKey,
-                    signature: signatureHex,
-                    challenge,
-                  }),
-                });
-
-                if (loginRes.ok) {
-                  const loginData = await loginRes.json();
-                  token = loginData.token;
-                  isAdminUser = Boolean(loginData.isAdmin);
-                  if (typeof localStorage !== 'undefined' && token) {
-                    localStorage.setItem('auth_token', token);
-                  }
-                }
-              }
-            } catch {
-              // Standalone / offline mode fallback
-            }
-
-            set({
-              isConnected: true,
-              publicKey: userPublicKey,
-              authToken: token,
-              isAdmin: isAdminUser,
-              network: currentNetwork || ALLOWED_NETWORK,
-              error: null,
-              isConnecting: false,
-            });
-          } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : 'Failed to connect wallet';
-            setError(errorMessage);
-            set({ isConnecting: false });
-            throw error;
+      connect: async (preferredRole = 'borrower') => {
+        set({ isLoading: true, error: null });
+        try {
+          const available = await checkFreighterConnected();
+          if (!available) {
+            throw new Error(
+              'Freighter wallet extension was not detected. Install or unlock Freighter to continue.'
+            );
           }
-        },
 
-        disconnect: () => {
-          if (typeof localStorage !== 'undefined') {
-            localStorage.removeItem('auth_token');
-          }
+          const publicKey = await requestFreighterAccess();
+          const passphrase = await getFreighterNetworkPassphrase(STELLAR_CONFIG.networkPassphrase);
+
+          const challengeRes = await apiRequest<{ challenge: string }>('/auth/challenge', {
+            method: 'GET',
+            skipAuth: true,
+          });
+          const signature = await signAuthChallenge(
+            challengeRes.challenge,
+            publicKey,
+            passphrase
+          );
+
+          const authRes = await apiRequest<{
+            token: string;
+            refreshToken: string;
+            publicKey: string;
+            role: UserRole;
+            roles: UserRole[];
+            isAdmin: boolean;
+          }>('/auth/login', {
+            method: 'POST',
+            skipAuth: true,
+            body: JSON.stringify({
+              publicKey,
+              challenge: challengeRes.challenge,
+              signature,
+              role: preferredRole,
+            }),
+          });
+
+          set({
+            isConnected: true,
+            publicKey: authRes.publicKey,
+            token: authRes.token,
+            refreshToken: authRes.refreshToken,
+            role: authRes.role,
+            roles: authRes.roles,
+            isAdmin: authRes.isAdmin,
+            isLoading: false,
+            error: null,
+          });
+
+          void get().refreshAccountBalance();
+        } catch (err) {
           set({
             isConnected: false,
             publicKey: null,
-            authToken: null,
-            isAdmin: false,
-            error: null,
-            isConnecting: false,
+            token: null,
+            refreshToken: null,
+            isLoading: false,
+            error: err instanceof Error ? err.message : 'Wallet connection failed',
           });
-        },
+          throw err;
+        }
+      },
 
-        setError: (error) => {
-          set({ error });
-        },
-
-        setConnecting: (isConnecting) => {
-          set({ isConnecting });
-        },
-
-        getAuthToken: () => {
-          return get().authToken || (typeof localStorage !== 'undefined' ? localStorage.getItem('auth_token') : null);
-        },
-
-        signTransaction: async (xdr: string) => {
-          if (typeof (window as any)?.freighter?.signTransaction === 'function') {
-            return await (window as any).freighter.signTransaction(xdr, { networkPassphrase: NETWORK_PASSPHRASE });
+      disconnect: async () => {
+        try {
+          if (get().token) {
+            await apiRequest('/auth/logout', { method: 'POST' }).catch(() => undefined);
           }
-          const result = await freighter.signTransaction(xdr, { networkPassphrase: NETWORK_PASSPHRASE });
-          return typeof result === 'string' ? result : (result as any)?.signedTxXdr || xdr;
-        },
+        } finally {
+          set({
+            isConnected: false,
+            publicKey: null,
+            token: null,
+            refreshToken: null,
+            role: 'borrower',
+            roles: ['borrower'],
+            isAdmin: false,
+            balance: null,
+            error: null,
+            txState: INITIAL_TX,
+          });
+        }
+      },
+
+      refreshAccountBalance: async () => {
+        const publicKey = get().publicKey;
+        if (!publicKey) return;
+        try {
+          const res = await fetch(`${STELLAR_CONFIG.horizonUrl}/accounts/${publicKey}`);
+          if (!res.ok) {
+            set({ balance: '0 (Unfunded Testnet)' });
+            return;
+          }
+          const data = (await res.json()) as {
+            balances?: Array<{ asset_type: string; balance: string }>;
+          };
+          const native = data.balances?.find((b) => b.asset_type === 'native');
+          set({ balance: native ? Number(native.balance).toFixed(2) : '0.00' });
+        } catch {
+          set({ balance: null });
+        }
+      },
+
+      clearError: () => set({ error: null }),
+      clearTxState: () => set({ txState: INITIAL_TX }),
+
+      executeSignedTx: async <T = any>({
+        preparePath,
+        prepareBody,
+        submitPath,
+        submitBody = {},
+      }: {
+        preparePath: string;
+        prepareBody: Record<string, unknown>;
+        submitPath: string;
+        submitBody?: Record<string, unknown>;
+      }): Promise<T> => {
+        const publicKey = get().publicKey;
+        if (!publicKey) {
+          throw new Error('Connect your Freighter wallet first.');
+        }
+
+        const idempotencyKey =
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `tx-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+        try {
+          set({
+            txState: {
+              stage: 'preparing',
+              message: 'Preparing Soroban transaction & simulation footprint...',
+            },
+          });
+
+          const prepRes = await apiRequest<{ xdr: string }>(preparePath, {
+            method: 'POST',
+            idempotencyKey: `${idempotencyKey}-prep`,
+            body: JSON.stringify(prepareBody),
+          });
+
+          set({
+            txState: {
+              stage: 'awaiting_signature',
+              message: 'Approve & sign the transaction in Freighter...',
+            },
+          });
+
+          const passphrase = await getFreighterNetworkPassphrase(STELLAR_CONFIG.networkPassphrase);
+          const signedXDR = await signSorobanXdr(prepRes.xdr, publicKey, passphrase);
+
+          set({
+            txState: {
+              stage: 'submitting',
+              message: 'Submitting to Stellar Soroban & waiting for ledger confirmation...',
+            },
+          });
+
+          const submitRes = await apiRequest<T & { transactionHash?: string; ledger?: number | null }>(
+            submitPath,
+            {
+              method: 'POST',
+              idempotencyKey: `${idempotencyKey}-sub`,
+              body: JSON.stringify({
+                ...submitBody,
+                signedXDR,
+              }),
+            }
+          );
+
+          set({
+            txState: {
+              stage: 'confirmed',
+              message: 'Confirmed on Stellar Soroban!',
+              txHash: submitRes.transactionHash,
+              ledger: submitRes.ledger ?? null,
+            },
+          });
+
+          void get().refreshAccountBalance();
+          return submitRes;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Transaction failed';
+          set({
+            txState: {
+              stage: 'error',
+              message: msg,
+            },
+          });
+          throw err;
+        }
+      },
+    }),
+    {
+      name: 'creditledger-wallet-session',
+      storage: createJSONStorage(() => sessionStorage),
+      partialize: (state) => ({
+        isConnected: state.isConnected,
+        publicKey: state.publicKey,
+        token: state.token,
+        refreshToken: state.refreshToken,
+        role: state.role,
+        roles: state.roles,
+        isAdmin: state.isAdmin,
+        network: state.network,
       }),
-      {
-        name: 'credit-ledger-wallet',
-        partialize: (state) => ({
-          publicKey: state.publicKey,
-          network: state.network,
-          authToken: state.authToken,
-          isAdmin: state.isAdmin,
-        }),
-      }
-    )
+    }
   )
 );
 
-// Type declaration for Freighter API
-declare global {
-  interface Window {
-    freighter?: {
-      isConnected: () => Promise<boolean>;
-      getPublicKey: () => Promise<string>;
-      getNetwork: () => Promise<string>;
-      signTransaction?: (xdr: string, opts?: any) => Promise<string>;
-      sign?: (data: any) => Promise<any>;
-    };
-  }
-}
+registerAuthTokensProvider({
+  getToken: () => useWalletStore.getState().token,
+  getRefreshToken: () => useWalletStore.getState().refreshToken,
+  setTokens: (token, refreshToken) => useWalletStore.setState({ token, refreshToken }),
+  clearSession: () =>
+    useWalletStore.setState({
+      isConnected: false,
+      publicKey: null,
+      token: null,
+      refreshToken: null,
+      isAdmin: false,
+      roles: ['borrower'],
+    }),
+});

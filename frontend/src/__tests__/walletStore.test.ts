@@ -1,67 +1,123 @@
-import { act } from '@testing-library/react';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useWalletStore } from '../store/walletStore';
+import * as freighter from '../services/freighter';
 
-// Reset store state between tests
-beforeEach(() => {
-  useWalletStore.setState({
-    isConnected: false,
-    isConnecting: false,
-    publicKey: null,
-    error: null,
-  });
-});
+describe('Wallet Store (Freighter Auth, Signing & Refresh Rotation)', () => {
+  const pubKey = 'GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR';
 
-describe('walletStore', () => {
-  it('has correct initial state', () => {
-    const state = useWalletStore.getState();
-    expect(state.isConnected).toBe(false);
-    expect(state.publicKey).toBeNull();
-    expect(state.error).toBeNull();
-  });
-
-  it('disconnect clears wallet state', () => {
-    useWalletStore.setState({ isConnected: true, publicKey: 'GABC' });
-    act(() => useWalletStore.getState().disconnect());
-    const state = useWalletStore.getState();
-    expect(state.isConnected).toBe(false);
-    expect(state.publicKey).toBeNull();
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    sessionStorage.clear();
+    useWalletStore.setState({
+      isConnected: false,
+      publicKey: null,
+      token: null,
+      refreshToken: null,
+      role: 'borrower',
+      roles: ['borrower'],
+      isAdmin: false,
+      balance: null,
+      isLoading: false,
+      error: null,
+      txState: { stage: 'idle' },
+    });
   });
 
-  it('setError updates error state', () => {
-    act(() => useWalletStore.getState().setError('something went wrong'));
-    expect(useWalletStore.getState().error).toBe('something went wrong');
+  it('aborts wallet connect if Freighter signMessage declines instead of spoofing auth', async () => {
+    vi.spyOn(freighter, 'checkFreighterConnected').mockResolvedValue(true);
+    vi.spyOn(freighter, 'requestFreighterAccess').mockResolvedValue(pubKey);
+    vi.spyOn(freighter, 'getFreighterNetworkPassphrase').mockResolvedValue(
+      'Test SDF Network ; September 2015'
+    );
+    vi.spyOn(freighter, 'signAuthChallenge').mockRejectedValue(
+      new Error('Wallet signature was declined or failed. Connection aborted.')
+    );
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({ challenge: 'deadbeef'.repeat(8) }),
+    } as Response);
+
+    await expect(useWalletStore.getState().connect('lender')).rejects.toThrow(/declined/i);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // Only GET /challenge; login never attempted!
+    expect(useWalletStore.getState().isConnected).toBe(false);
+    expect(useWalletStore.getState().token).toBeNull();
   });
 
-  it('setConnecting updates isConnecting', () => {
-    act(() => useWalletStore.getState().setConnecting(true));
-    expect(useWalletStore.getState().isConnecting).toBe(true);
-  });
+  it('connects cleanly with real challenge signature and stores role & tokens', async () => {
+    vi.spyOn(freighter, 'checkFreighterConnected').mockResolvedValue(true);
+    vi.spyOn(freighter, 'requestFreighterAccess').mockResolvedValue(pubKey);
+    vi.spyOn(freighter, 'getFreighterNetworkPassphrase').mockResolvedValue(
+      'Test SDF Network ; September 2015'
+    );
+    vi.spyOn(freighter, 'signAuthChallenge').mockResolvedValue('ab'.repeat(64));
 
-  it('connect throws when Freighter is not available', async () => {
-    // Ensure window.freighter is undefined
-    (window as any).freighter = undefined;
-    await expect(useWalletStore.getState().connect()).rejects.toThrow('Freighter wallet not detected');
-    expect(useWalletStore.getState().isConnecting).toBe(false);
-  });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/auth/challenge')) {
+        return { ok: true, text: async () => JSON.stringify({ challenge: 'cd'.repeat(32) }) } as Response;
+      }
+      if (url.endsWith('/auth/login')) {
+        return {
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              token: 'jwt-access-1',
+              refreshToken: 'refresh-1',
+              publicKey: pubKey,
+              role: 'lender',
+              roles: ['borrower', 'lender'],
+              isAdmin: false,
+            }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({ balances: [{ asset_type: 'native', balance: '9950.00' }] }),
+      } as Response;
+    });
 
-  it('connect throws when on wrong network', async () => {
-    (window as any).freighter = {
-      getNetwork: async () => 'mainnet',
-      getPublicKey: async () => 'GABC',
-      isConnected: async () => true,
-    };
-    await expect(useWalletStore.getState().connect()).rejects.toThrow('Please switch to');
-  });
-
-  it('connect sets publicKey on success', async () => {
-    (window as any).freighter = {
-      getNetwork: async () => 'testnet',
-      getPublicKey: async () => 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
-      isConnected: async () => true,
-    };
-    await act(async () => { await useWalletStore.getState().connect(); });
+    await useWalletStore.getState().connect('lender');
     const state = useWalletStore.getState();
     expect(state.isConnected).toBe(true);
-    expect(state.publicKey).toBe('GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN');
+    expect(state.role).toBe('lender');
+    expect(state.token).toBe('jwt-access-1');
+    await vi.waitFor(() => {
+      expect(useWalletStore.getState().balance).toBe('9950.00');
+    });
+  });
+
+  it('executes non-custodial prepare -> Freighter sign -> confirmed lifecycle cleanly', async () => {
+    useWalletStore.setState({ isConnected: true, publicKey: pubKey, token: 'tok-1' });
+    vi.spyOn(freighter, 'getFreighterNetworkPassphrase').mockResolvedValue(
+      'Test SDF Network ; September 2015'
+    );
+    const signSpy = vi.spyOn(freighter, 'signSorobanXdr').mockResolvedValue('SIGNED_XDR_BLOB');
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/loans/prepare-apply')) {
+        return { ok: true, text: async () => JSON.stringify({ xdr: 'UNSIGNED_XDR_BLOB' }) } as Response;
+      }
+      if (url.endsWith('/loans/submit')) {
+        return {
+          ok: true,
+          text: async () => JSON.stringify({ success: true, transactionHash: 'hash_ok_1', ledger: 5683000 }),
+        } as Response;
+      }
+      return { ok: false, status: 404, text: async () => '' } as Response;
+    });
+
+    const res = await useWalletStore.getState().executeSignedTx({
+      preparePath: '/loans/prepare-apply',
+      prepareBody: { borrowerPublicKey: pubKey, amount: '100', durationMonths: 12 },
+      submitPath: '/loans/submit',
+      submitBody: { action: 'apply' },
+    });
+
+    expect(signSpy).toHaveBeenCalledWith('UNSIGNED_XDR_BLOB', pubKey, 'Test SDF Network ; September 2015');
+    expect(res.transactionHash).toBe('hash_ok_1');
+    expect(useWalletStore.getState().txState.stage).toBe('confirmed');
+    expect(useWalletStore.getState().txState.txHash).toBe('hash_ok_1');
   });
 });

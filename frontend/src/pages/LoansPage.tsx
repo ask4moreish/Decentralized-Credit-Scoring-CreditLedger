@@ -1,285 +1,275 @@
-import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useWalletStore } from '../store/walletStore';
-import { API_URL } from '../config/stellar';
-import { Button } from '../components/Button';
-
-async function fetchLoans(publicKey: string, token?: string | null) {
-  const headers: HeadersInit = {};
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-  const res = await fetch(`${API_URL}/api/loans/user/${publicKey}`, { headers });
-  if (!res.ok) throw new Error('Failed to fetch loans');
-  return res.json();
-}
-
-const STATUS_COLORS: Record<string, string> = {
-  pending: 'bg-yellow-100 text-yellow-800',
-  active: 'bg-blue-100 text-blue-800',
-  repaid: 'bg-green-100 text-green-800',
-  defaulted: 'bg-red-100 text-red-800',
-};
+import { apiRequest } from '../services/api';
+import { formatStroops } from '../config/stellar';
+import { LoadingSpinner } from '../components/LoadingSpinner';
 
 export function LoansPage() {
-  const { publicKey, getAuthToken, signTransaction } = useWalletStore();
-  const token = getAuthToken();
-
-  const [amount, setAmount] = useState('');
+  const { publicKey, executeSignedTx } = useWalletStore();
+  const [loading, setLoading] = useState(true);
+  const [loans, setLoans] = useState<any[]>([]);
+  const [amount, setAmount] = useState('100');
   const [durationMonths, setDurationMonths] = useState('12');
-  const [isApplying, setIsApplying] = useState(false);
-  const [applyError, setApplyError] = useState('');
-  const [applySuccess, setApplySuccess] = useState('');
+  const [collateralAmount, setCollateralAmount] = useState('0');
+  const [repayInputs, setRepayInputs] = useState<Record<number, string>>({});
+  const [eligibility, setEligibility] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const [repayLoanId, setRepayLoanId] = useState<number | null>(null);
-  const [repayAmount, setRepayAmount] = useState('');
-  const [isRepaying, setIsRepaying] = useState(false);
+  const loadLoans = useCallback(async () => {
+    if (!publicKey) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await apiRequest<{ data: { loans: any[] } }>(`/loans/user/${publicKey}`);
+      setLoans(res.data.loans || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch loans');
+    } finally {
+      setLoading(false);
+    }
+  }, [publicKey]);
 
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['loans', publicKey],
-    queryFn: () => fetchLoans(publicKey!, token),
-    enabled: !!publicKey,
-  });
+  useEffect(() => {
+    void loadLoans();
+  }, [loadLoans]);
 
-  const loans: any[] = data?.data?.loans ?? [];
+  const handleCheckEligibility = async () => {
+    if (!publicKey) return;
+    setError(null);
+    try {
+      const res = await apiRequest<{ data: any }>('/loans/check-eligibility', {
+        method: 'POST',
+        body: JSON.stringify({ userPublicKey: publicKey, amount }),
+      });
+      setEligibility(res.data);
+      if (res.data.requiredCollateralFormatted && Number(collateralAmount) === 0) {
+        setCollateralAmount(res.data.requiredCollateralFormatted);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Eligibility check failed');
+    }
+  };
 
-  async function handleApply(e: React.FormEvent) {
+  const handleApplyLoan = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!publicKey) return;
-
-    setIsApplying(true);
-    setApplyError('');
-    setApplySuccess('');
-
+    setError(null);
     try {
-      // 1. Prepare unsigned transaction from backend
-      const prepRes = await fetch(`${API_URL}/api/loans/prepare-apply`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
+      await executeSignedTx({
+        preparePath: '/loans/prepare-apply',
+        prepareBody: {
           borrowerPublicKey: publicKey,
-          amount: parseFloat(amount),
-          durationMonths: parseInt(durationMonths),
-        }),
-      });
-
-      if (!prepRes.ok) {
-        const errJson = await prepRes.json().catch(() => ({}));
-        throw new Error(errJson.error || 'Failed to prepare loan application');
-      }
-
-      const { xdr } = await prepRes.json();
-
-      // 2. Sign transaction with Freighter wallet
-      let signedXdr = xdr;
-      try {
-        signedXdr = await signTransaction(xdr);
-      } catch (signErr: any) {
-        throw new Error(`Freighter signature rejected: ${signErr.message || signErr}`);
-      }
-
-      // 3. Submit signed transaction
-      const submitRes = await fetch(`${API_URL}/api/loans/submit`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+          amount,
+          durationMonths: Number(durationMonths),
+          collateralAmount,
         },
-        body: JSON.stringify({
-          signedXDR: signedXdr,
-          borrowerPublicKey: publicKey,
-          amount: parseFloat(amount),
-          durationMonths: parseInt(durationMonths),
+        submitPath: '/loans/submit',
+        submitBody: {
           action: 'apply',
-        }),
+          borrowerPublicKey: publicKey,
+          amount,
+          durationMonths: Number(durationMonths),
+        },
       });
-
-      if (!submitRes.ok) {
-        const submitErr = await submitRes.json().catch(() => ({}));
-        throw new Error(submitErr.error || 'Failed to submit loan transaction');
-      }
-
-      setApplySuccess('Loan application successfully created and submitted!');
-      setAmount('');
-      refetch();
-    } catch (err: any) {
-      setApplyError(err.message || 'Error creating loan application');
-    } finally {
-      setIsApplying(false);
+      await loadLoans();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Loan application failed');
     }
-  }
+  };
 
-  async function handleRepay(loanId: number) {
-    if (!publicKey || !repayAmount) return;
-
-    setIsRepaying(true);
+  const handleRepay = async (loanId: number) => {
+    const repayAmount = repayInputs[loanId] || '10';
+    setError(null);
     try {
-      const prepRes = await fetch(`${API_URL}/api/loans/prepare-repay`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          loanId,
-          amount: parseFloat(repayAmount),
-        }),
+      await executeSignedTx({
+        preparePath: '/loans/prepare-repay',
+        prepareBody: { loanId, amount: repayAmount },
+        submitPath: '/loans/submit',
+        submitBody: { action: 'repay', loanId, borrowerPublicKey: publicKey, amount: repayAmount },
       });
-
-      if (!prepRes.ok) {
-        const errJson = await prepRes.json().catch(() => ({}));
-        throw new Error(errJson.error || 'Failed to prepare repayment');
-      }
-
-      const { xdr } = await prepRes.json();
-      const signedXdr = await signTransaction(xdr);
-
-      await fetch(`${API_URL}/api/loans/submit`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          signedXDR: signedXdr,
-          loanId,
-          amount: parseFloat(repayAmount),
-          action: 'repay',
-        }),
-      });
-
-      setRepayLoanId(null);
-      setRepayAmount('');
-      refetch();
-    } catch (err: any) {
-      alert(`Repayment failed: ${err.message || err}`);
-    } finally {
-      setIsRepaying(false);
+      await loadLoans();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Loan repayment failed');
     }
-  }
+  };
+
+  const handleCancel = async (loanId: number) => {
+    setError(null);
+    try {
+      await executeSignedTx({
+        preparePath: '/loans/prepare-cancel',
+        prepareBody: { loanId },
+        submitPath: '/loans/submit',
+        submitBody: { action: 'cancel', loanId, borrowerPublicKey: publicKey },
+      });
+      await loadLoans();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Loan cancellation failed');
+    }
+  };
 
   return (
-    <div className="max-w-3xl mx-auto py-8 px-4">
-      <h1 className="text-2xl font-bold text-gray-900 mb-2">Decentralized Loans</h1>
-      <p className="text-sm text-gray-500 mb-6">
-        Borrow against your on-chain credit reputation with non-custodial Freighter transaction authorization.
-      </p>
-
-      {/* Loan Application Form */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6 mb-8 shadow-sm">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Apply for a Loan</h2>
-        {applyError && <p className="text-red-500 text-sm mb-3 bg-red-50 p-2 rounded">{applyError}</p>}
-        {applySuccess && <p className="text-green-600 text-sm mb-3 bg-green-50 p-2 rounded">{applySuccess}</p>}
-
-        <form onSubmit={handleApply} className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm text-gray-600 mb-1">Loan Amount (XLM)</label>
-              <input
-                type="number"
-                step="any"
-                min="1"
-                placeholder="e.g. 500"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                required
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-600 mb-1">Duration (Months)</label>
-              <select
-                value={durationMonths}
-                onChange={(e) => setDurationMonths(e.target.value)}
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              >
-                <option value="3">3 Months</option>
-                <option value="6">6 Months</option>
-                <option value="12">12 Months</option>
-                <option value="24">24 Months</option>
-              </select>
-            </div>
-          </div>
-
-          <Button type="submit" isLoading={isApplying} disabled={isApplying} className="w-full">
-            {isApplying ? 'Sign in Freighter…' : 'Submit Loan Application'}
-          </Button>
-        </form>
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900">Borrower Loans &amp; Collateral</h1>
+        <p className="text-sm text-slate-600">
+          Non-custodial Soroban loan requests with LTV-enforced collateral locking and amortized
+          repayments.
+        </p>
       </div>
 
-      <h2 className="text-lg font-semibold text-gray-900 mb-4">Your Loan Portfolio</h2>
-
-      {isLoading && <p className="text-gray-500">Loading loans…</p>}
-      {Boolean(error) && <p className="text-red-500">Failed to load loans.</p>}
-
-      {!isLoading && loans.length === 0 && (
-        <div className="bg-gray-50 rounded-xl border border-dashed border-gray-200 p-8 text-center text-gray-500 text-sm">
-          No loan records found for this account.
+      {error && (
+        <div
+          role="alert"
+          className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800"
+        >
+          {error}
         </div>
       )}
 
-      <div className="space-y-4">
-        {loans.map((loan) => (
-          <div key={loan.id} className="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <span className="font-semibold text-gray-900">Loan #{loan.id}</span>
-              <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${STATUS_COLORS[loan.status] ?? 'bg-gray-100 text-gray-700'}`}>
-                {loan.status}
-              </span>
-            </div>
-            <div className="grid grid-cols-4 gap-2 text-sm text-gray-600 mb-4">
-              <div>
-                <span className="text-xs text-gray-400">Principal</span>
-                <br />
-                <span className="font-semibold">{loan.amount}</span>
-              </div>
-              <div>
-                <span className="text-xs text-gray-400">Interest Rate</span>
-                <br />
-                <span className="font-semibold">{loan.interest_rate || loan.interestRate || 10}%</span>
-              </div>
-              <div>
-                <span className="text-xs text-gray-400">Duration</span>
-                <br />
-                <span className="font-semibold">{loan.duration_months || loan.durationMonths}mo</span>
-              </div>
-              <div>
-                <span className="text-xs text-gray-400">Repaid</span>
-                <br />
-                <span className="font-semibold">{loan.repaid_amount || loan.repaidAmount || 0}</span>
-              </div>
-            </div>
+      <form
+        onSubmit={handleApplyLoan}
+        className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm"
+      >
+        <h2 className="text-base font-semibold text-slate-900">Apply for a Loan</h2>
+        <div className="mt-4 grid gap-4 sm:grid-cols-3">
+          <div>
+            <label className="block text-xs font-medium text-slate-600">Loan Amount (XLM)</label>
+            <input
+              type="text"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-600">Duration (Months)</label>
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={durationMonths}
+              onChange={(e) => setDurationMonths(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-600">
+              Collateral Deposit (XLM, required if score &lt; 60)
+            </label>
+            <input
+              type="text"
+              value={collateralAmount}
+              onChange={(e) => setCollateralAmount(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            />
+          </div>
+        </div>
 
-            {loan.status === 'active' && (
-              <div className="border-t pt-3 mt-3">
-                {repayLoanId === loan.id ? (
-                  <div className="flex gap-2">
-                    <input
-                      type="number"
-                      placeholder="Amount to repay"
-                      value={repayAmount}
-                      onChange={(e) => setRepayAmount(e.target.value)}
-                      className="border border-gray-300 rounded px-2 py-1 text-sm flex-1"
-                    />
-                    <Button size="sm" isLoading={isRepaying} onClick={() => handleRepay(loan.id)}>
-                      Confirm
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => setRepayLoanId(null)}>
-                      Cancel
-                    </Button>
-                  </div>
-                ) : (
-                  <Button size="sm" variant="outline" onClick={() => setRepayLoanId(loan.id)}>
-                    Make Repayment
-                  </Button>
-                )}
-              </div>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleCheckEligibility}
+            className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Check Eligibility &amp; LTV Collateral
+          </button>
+          <button
+            type="submit"
+            className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500"
+          >
+            Prepare &amp; Sign Loan Application
+          </button>
+        </div>
+
+        {eligibility && (
+          <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+            <div>
+              Eligible: <strong>{eligibility.canBorrow ? 'Yes' : 'No'}</strong> | Verified Score:{' '}
+              <strong>{eligibility.creditScore}</strong> | Required Collateral:{' '}
+              <strong>{eligibility.requiredCollateralFormatted} XLM</strong>
+            </div>
+            {eligibility.reasons?.length > 0 && (
+              <div className="mt-1 text-rose-700">{eligibility.reasons.join(', ')}</div>
             )}
           </div>
-        ))}
+        )}
+      </form>
+
+      <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 className="text-base font-semibold text-slate-900">Your Loans ({loans.length})</h2>
+        {loading ? (
+          <div className="flex justify-center py-8">
+            <LoadingSpinner />
+          </div>
+        ) : loans.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">No loans found for your account.</p>
+        ) : (
+          <div className="mt-4 space-y-4">
+            {loans.map((loan) => {
+              const id = Number(loan.id);
+              const status = String(loan.status).toLowerCase();
+              return (
+                <div
+                  key={id}
+                  className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-slate-200 p-4"
+                >
+                  <div className="space-y-1 text-sm">
+                    <div className="flex items-center gap-2 font-semibold">
+                      <span>Loan #{id}</span>
+                      <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs uppercase text-slate-700">
+                        {status}
+                      </span>
+                    </div>
+                    <div className="text-xs text-slate-600">
+                      Principal: {formatStroops(loan.amount)} XLM | Rate: {loan.interest_rate}% APR |
+                      Term: {loan.duration_months} mo
+                    </div>
+                    <div className="text-xs text-slate-600">
+                      Repaid: {formatStroops(loan.repaid_amount)} XLM | Collateral:{' '}
+                      {formatStroops(loan.collateral_amount)} XLM (
+                      {loan.collateral_locked ? 'Locked' : 'Unlocked'})
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {status === 'pending' && (
+                      <button
+                        type="button"
+                        onClick={() => handleCancel(id)}
+                        className="rounded-lg border border-rose-300 px-3 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-50"
+                      >
+                        Cancel Pending
+                      </button>
+                    )}
+                    {status === 'active' && (
+                      <>
+                        <input
+                          type="text"
+                          value={repayInputs[id] || ''}
+                          onChange={(e) =>
+                            setRepayInputs((prev) => ({ ...prev, [id]: e.target.value }))
+                          }
+                          placeholder="Amount XLM"
+                          className="w-28 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleRepay(id)}
+                          className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                        >
+                          Repay
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );

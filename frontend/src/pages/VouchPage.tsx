@@ -1,101 +1,244 @@
-import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useWalletStore } from '../store/walletStore';
-import { API_URL } from '../config/stellar';
-
-async function fetchVouches(publicKey: string, token: string) {
-  const res = await fetch(`${API_URL}/api/vouch/user/${publicKey}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error('Failed to fetch vouches');
-  return res.json();
-}
+import { apiRequest } from '../services/api';
+import { formatStroops } from '../config/stellar';
+import { LoadingSpinner } from '../components/LoadingSpinner';
 
 export function VouchPage() {
-  const { publicKey } = useWalletStore();
-  const token = localStorage.getItem('auth_token') ?? '';
-  const [form, setForm] = useState({ voucheePublicKey: '', amount: '', trustScore: '50', reason: '', durationMonths: '12' });
-  const [submitting, setSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState('');
+  const { publicKey, executeSignedTx } = useWalletStore();
+  const [loading, setLoading] = useState(true);
+  const [vouches, setVouches] = useState<any[]>([]);
+  const [voucheePublicKey, setVoucheePublicKey] = useState('');
+  const [amount, setAmount] = useState('50');
+  const [reason, setReason] = useState('Verified business peer');
+  const [durationMonths, setDurationMonths] = useState('6');
+  const [error, setError] = useState<string | null>(null);
 
-  const { data, isLoading, refetch } = useQuery({
-    queryKey: ['vouches', publicKey],
-    queryFn: () => fetchVouches(publicKey!, token),
-    enabled: !!publicKey,
-  });
-
-  const vouches: any[] = data?.data ?? [];
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSubmitting(true);
-    setSubmitError('');
+  const loadVouches = useCallback(async () => {
+    if (!publicKey) return;
+    setLoading(true);
+    setError(null);
     try {
-      const res = await fetch(`${API_URL}/api/vouch/create`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ voucherPublicKey: publicKey, ...form, amount: Number(form.amount), trustScore: Number(form.trustScore), durationMonths: Number(form.durationMonths) }),
-      });
-      if (!res.ok) throw new Error((await res.json()).error);
-      setForm({ voucheePublicKey: '', amount: '', trustScore: '50', reason: '', durationMonths: '12' });
-      refetch();
-    } catch (err: any) {
-      setSubmitError(err.message);
+      const res = await apiRequest<{ data: any[] }>(`/vouch/user/${publicKey}`);
+      setVouches(res.data || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load vouches');
     } finally {
-      setSubmitting(false);
+      setLoading(false);
     }
-  }
+  }, [publicKey]);
+
+  useEffect(() => {
+    void loadVouches();
+  }, [loadVouches]);
+
+  const handleCreateVouch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!publicKey) return;
+    setError(null);
+    try {
+      await executeSignedTx({
+        preparePath: '/vouch/prepare-create',
+        prepareBody: {
+          voucherPublicKey: publicKey,
+          voucheePublicKey: voucheePublicKey.trim(),
+          amount,
+          reason,
+          durationMonths: Number(durationMonths),
+        },
+        submitPath: '/vouch/submit',
+        submitBody: {
+          action: 'create',
+          voucherPublicKey: publicKey,
+          voucheePublicKey: voucheePublicKey.trim(),
+          amount,
+          reason,
+        },
+      });
+      setVoucheePublicKey('');
+      await loadVouches();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create vouch');
+    }
+  };
+
+  const handleVouchAction = async (
+    vouchId: number,
+    action: 'revoke' | 'expire' | 'withdraw',
+    voucheeKey?: string
+  ) => {
+    if (!publicKey) return;
+    setError(null);
+    const preparePath =
+      action === 'revoke'
+        ? `/vouch/${vouchId}/prepare-revoke`
+        : action === 'expire'
+          ? `/vouch/${vouchId}/prepare-expire`
+          : `/vouch/${vouchId}/prepare-withdraw`;
+
+    try {
+      await executeSignedTx({
+        preparePath,
+        prepareBody: { voucherPublicKey: publicKey },
+        submitPath: '/vouch/submit',
+        submitBody: {
+          action,
+          vouchId,
+          voucherPublicKey: publicKey,
+          voucheePublicKey: voucheeKey,
+        },
+      });
+      await loadVouches();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Vouch ${action} failed`);
+    }
+  };
 
   return (
-    <div className="max-w-3xl mx-auto py-8 px-4">
-      <h1 className="text-2xl font-bold text-gray-900 mb-6">Community Vouching</h1>
-
-      <div className="bg-white rounded-xl border border-gray-200 p-6 mb-8">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Create a Vouch</h2>
-        {submitError && <p className="text-red-500 text-sm mb-3">{submitError}</p>}
-        <form onSubmit={handleSubmit} className="space-y-3">
-          {[
-            { name: 'voucheePublicKey', label: 'Vouchee Public Key', type: 'text' },
-            { name: 'amount', label: 'Amount', type: 'number' },
-            { name: 'trustScore', label: 'Trust Score (0–100)', type: 'number' },
-            { name: 'reason', label: 'Reason', type: 'text' },
-            { name: 'durationMonths', label: 'Duration (months)', type: 'number' },
-          ].map(({ name, label, type }) => (
-            <div key={name}>
-              <label className="block text-sm text-gray-600 mb-1">{label}</label>
-              <input
-                type={type}
-                value={(form as any)[name]}
-                onChange={(e) => setForm((f) => ({ ...f, [name]: e.target.value }))}
-                required
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-            </div>
-          ))}
-          <button
-            type="submit"
-            disabled={submitting}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-medium py-2 rounded-lg transition-colors"
-          >
-            {submitting ? 'Submitting…' : 'Create Vouch'}
-          </button>
-        </form>
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900">Escrowed Community Vouching</h1>
+        <p className="text-sm text-slate-600">
+          Back trusted borrowers with real SEP-41 token escrow. Trust weight is calculated
+          deterministically on-chain from your verified score and stake, subject to time decay and a
+          50% borrower-default slash cap.
+        </p>
       </div>
 
-      <h2 className="text-lg font-semibold text-gray-900 mb-3">Your Vouches</h2>
-      {isLoading && <p className="text-gray-500">Loading…</p>}
-      {!isLoading && vouches.length === 0 && <p className="text-gray-500">No vouches yet.</p>}
-      <div className="space-y-3">
-        {vouches.map((v: any) => (
-          <div key={v.id} className="bg-white rounded-xl border border-gray-200 p-4 text-sm">
-            <p className="font-mono text-xs text-gray-500 truncate mb-1">{v.vouchee}</p>
-            <div className="flex gap-4 text-gray-700">
-              <span>Amount: {v.amount}</span>
-              <span>Trust: {v.trust_score}</span>
-              <span className={v.is_active ? 'text-green-600' : 'text-gray-400'}>{v.is_active ? 'Active' : 'Inactive'}</span>
-            </div>
+      {error && (
+        <div
+          role="alert"
+          className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800"
+        >
+          {error}
+        </div>
+      )}
+
+      <form
+        onSubmit={handleCreateVouch}
+        className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm"
+      >
+        <h2 className="text-base font-semibold text-slate-900">Create Escrowed Vouch</h2>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <label className="block text-xs font-medium text-slate-600">
+              Vouchee Stellar Public Key
+            </label>
+            <input
+              type="text"
+              value={voucheePublicKey}
+              onChange={(e) => setVoucheePublicKey(e.target.value)}
+              placeholder="G..."
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm"
+              required
+            />
           </div>
-        ))}
+          <div>
+            <label className="block text-xs font-medium text-slate-600">Escrow Stake (XLM)</label>
+            <input
+              type="text"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-600">Duration (1-24 Months)</label>
+            <input
+              type="number"
+              min={1}
+              max={24}
+              value={durationMonths}
+              onChange={(e) => setDurationMonths(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              required
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="block text-xs font-medium text-slate-600">Reason / Context</label>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              required
+            />
+          </div>
+        </div>
+        <button
+          type="submit"
+          className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500"
+        >
+          Stake &amp; Sign Vouch in Freighter
+        </button>
+      </form>
+
+      <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 className="text-base font-semibold text-slate-900">Your Vouches ({vouches.length})</h2>
+        {loading ? (
+          <div className="flex justify-center py-8">
+            <LoadingSpinner />
+          </div>
+        ) : vouches.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">No vouches created yet.</p>
+        ) : (
+          <div className="mt-4 space-y-3">
+            {vouches.map((v) => {
+              const id = Number(v.id);
+              const vouchee = v.vouchee_key || v.vouchee;
+              const isVoucher = (v.voucher_key || v.voucher) === publicKey;
+              return (
+                <div
+                  key={id}
+                  className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-slate-200 p-4 text-sm"
+                >
+                  <div className="space-y-1">
+                    <div className="font-semibold">
+                      Vouch #{id} &rarr;{' '}
+                      <span className="font-mono text-xs">{String(vouchee).slice(0, 14)}...</span>
+                    </div>
+                    <div className="text-xs text-slate-600">
+                      Stake: {formatStroops(v.amount)} XLM | Escrowed Balance:{' '}
+                      {formatStroops(v.escrowed_balance)} XLM | Slashed:{' '}
+                      {formatStroops(v.slashed_amount)} XLM | Policy Trust Weight: {v.trust_score}
+                    </div>
+                    <div className="text-xs text-slate-500">{v.reason}</div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {isVoucher && v.is_active && (
+                      <button
+                        type="button"
+                        onClick={() => handleVouchAction(id, 'revoke', vouchee)}
+                        className="rounded-lg border border-rose-300 px-3 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-50"
+                      >
+                        Revoke &amp; Refund
+                      </button>
+                    )}
+                    {v.is_active && (
+                      <button
+                        type="button"
+                        onClick={() => handleVouchAction(id, 'expire', vouchee)}
+                        className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                      >
+                        Expire
+                      </button>
+                    )}
+                    {isVoucher && !v.is_active && !v.withdrawn && (
+                      <button
+                        type="button"
+                        onClick={() => handleVouchAction(id, 'withdraw', vouchee)}
+                        className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                      >
+                        Withdraw Remaining
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );

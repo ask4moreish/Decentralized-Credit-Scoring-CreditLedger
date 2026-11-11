@@ -1,45 +1,84 @@
 import React from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import { Link, NavLink, useNavigate } from 'react-router-dom';
 import { useWalletStore } from '../store/walletStore';
-
-const NAV = [
-  { href: '/dashboard', label: 'Dashboard' },
-  { href: '/credit-score', label: 'Credit Score' },
-  { href: '/loans', label: 'Loans' },
-  { href: '/vouch', label: 'Vouch' },
-  { href: '/profile', label: 'Profile' },
-];
+import { TxStatusBanner } from './TxStatusBanner';
 
 export function Layout({ children }: { children: React.ReactNode }) {
-  const { pathname } = useLocation();
-  const { publicKey } = useWalletStore();
+  const { publicKey, balance, role, roles, isAdmin, network, disconnect } = useWalletStore();
+  const navigate = useNavigate();
+
+  const canAccessAdmin = isAdmin || roles.includes('issuer');
+
+  const navLinks = [
+    { to: '/dashboard', label: 'Dashboard' },
+    { to: '/credit-score', label: 'Credit Score' },
+    { to: '/loans', label: 'Loans' },
+    { to: '/lender', label: 'Lender Pool' },
+    { to: '/vouch', label: 'Vouch' },
+    ...(canAccessAdmin ? [{ to: '/admin', label: 'Admin / Issuer' }] : []),
+    { to: '/profile', label: 'Profile' },
+  ];
+
+  const handleDisconnect = async () => {
+    await disconnect();
+    navigate('/login');
+  };
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <nav className="bg-white border-b border-gray-200">
-        <div className="max-w-5xl mx-auto px-4 flex items-center justify-between h-14">
-          <Link to="/dashboard" className="font-bold text-indigo-600 text-lg">CreditLedger</Link>
-          <div className="flex items-center gap-1">
-            {NAV.map(({ href, label }) => (
-              <Link
-                key={href}
-                to={href}
-                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                  pathname === href
-                    ? 'bg-indigo-50 text-indigo-700'
-                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
-                }`}
-              >
-                {label}
-              </Link>
-            ))}
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-4 py-3">
+          <div className="flex items-center gap-6">
+            <Link to="/" className="text-xl font-bold tracking-tight text-indigo-700">
+              CreditLedger
+            </Link>
+            <nav className="flex flex-wrap items-center gap-2 text-sm font-medium">
+              {navLinks.map((item) => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  className={({ isActive }) =>
+                    `rounded-md px-3 py-1.5 transition ${
+                      isActive
+                        ? 'bg-indigo-50 text-indigo-700'
+                        : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                    }`
+                  }
+                >
+                  {item.label}
+                </NavLink>
+              ))}
+            </nav>
           </div>
-          <span className="text-xs text-gray-400 font-mono hidden sm:block">
-            {publicKey?.slice(0, 8)}…{publicKey?.slice(-4)}
-          </span>
+
+          <div className="flex items-center gap-3 text-xs">
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 font-medium uppercase text-slate-700">
+              {network}
+            </span>
+            <span className="rounded-full bg-indigo-50 px-2.5 py-1 font-semibold capitalize text-indigo-700">
+              {role}
+            </span>
+            {publicKey && (
+              <span className="font-mono text-slate-600" title={publicKey}>
+                {publicKey.slice(0, 6)}...{publicKey.slice(-4)}
+                {balance ? ` (${balance} XLM)` : ''}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleDisconnect}
+              className="rounded-md border border-slate-300 px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100"
+            >
+              Disconnect
+            </button>
+          </div>
         </div>
-      </nav>
-      <main>{children}</main>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-6">
+        <TxStatusBanner />
+        {children}
+      </main>
     </div>
   );
 }
